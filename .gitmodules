@@ -32,26 +32,29 @@
 	path = barclamps/test
 	url = http://github.com/dellcloudedge/barclamp-test.git
 [submodule "barclamps/nova"]
-        path = barclamps/nova
-        url = http://github.com/dellcloudedge/barclamp-nova.git
+    path = barclamps/nova
+    url = http://github.com/MirantisDellCrowbar/barclamp-nova.git
 [submodule "barclamps/swift"]
-        path = barclamps/swift
-        url = http://github.com/dellcloudedge/barclamp-swift.git
+    path = barclamps/swift
+    url = http://github.com/dellcloudedge/barclamp-swift.git
 [submodule "barclamps/glance"]
-        path = barclamps/glance
-        url = http://github.com/dellcloudedge/barclamp-glance.git
+    path = barclamps/glance
+    url = http://github.com/MirantisDellCrowbar/barclamp-glance.git
 [submodule "barclamps/mysql"]
 	path = barclamps/mysql
 	url = http://github.com/dellcloudedge/barclamp-mysql.git
 [submodule "barclamps/nova_dashboard"]
-        path = barclamps/nova_dashboard
-        url = http://github.com/dellcloudedge/barclamp-nova_dashboard.git
+    path = barclamps/nova_dashboard
+    url = http://github.com/MirantisDellCrowbar/barclamp-nova_dashboard.git
 [submodule "barclamps/openstack"]
 	path = barclamps/openstack
 	url = http://github.com/dellcloudedge/barclamp-openstack.git
 [submodule "barclamps/keystone"]
 	path = barclamps/keystone
-	url = http://github.com/dellcloudedge/barclamp-keystone.git
+	url = http://github.com/MirantisDellCrowbar/barclamp-keystone.git
 [submodule "barclamps/tempest"]
 	path = barclamps/tempest
 	url = http://github.com/dellcloudedge/barclamp-tempest.git
+[submodule "barclamps/git"]
+	path = barclamps/git
+	url = http://github.com/MirantisDellCrowbar/barclamp-git.git

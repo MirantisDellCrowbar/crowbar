@@ -529,8 +529,14 @@ def bc_install_layout_1_cache(bc, path, barclamp, options={})
     puts ent.inspect if debug
     case
     when ent == "files"
-      puts "Copying files" if debug  
+      puts "Copying files" if debug
       system "cp -r \"#{path}/cache/#{ent}\" /tftpboot"
+    when ent == "git_repos"
+      puts "Copying cached git repos" if debug
+      unless File.directory? "/tftpboot/git_repos/#{bc}"
+          system "mkdir -p /tftpboot/git_repos/#{bc}"
+      end
+      system "rsync -a \"#{path}/cache/#{ent}/\" /tftpboot/git_repos/#{bc}"
     when ent == "gems"
       # Symlink the gems into One Flat Directory.
       puts "Installing gems" if debug

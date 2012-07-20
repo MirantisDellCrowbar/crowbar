@@ -75,7 +75,7 @@ for barclamp in "${BARCLAMPS[@]}"; do
 	    mkdir -p cache
 	    cd cache
 	    if [[ $OS_PKGS ]]; then
-		for d in files gems "$OS_PKGS"; do
+		for d in files gems git_repos "$OS_PKGS"; do
 		    [[ -d $CACHE_DIR/barclamps/$bc/$d ]] || continue
 		    [[ -L $d ]] || ln -s "$CACHE_DIR/barclamps/$bc/$d" .
 		done
