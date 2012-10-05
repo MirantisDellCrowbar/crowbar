@@ -446,22 +446,7 @@ do_crowbar_build() {
     for bc in "${BARCLAMPS[@]}"; do
         is_barclamp "$bc" || die "Cannot find barclamp $bc!"
         debug "Staging $bc barclamp."
-        if [[ "$bc" == "git" ]]; then
-            git_attr_file="$CROWBAR_DIR/barclamps/$bc/chef/cookbooks/$bc/attributes/default.rb"
-            echo 'default["repos"] = {' > $git_attr_file
-            for tbc in "${!BC_GIT_REPOS[@]}"; do
-                echo "\"$tbc\" => [" >> $git_attr_file
-                IFS=`echo`
-                data=`printf "${BC_GIT_REPOS[$tbc]}"`
-                for repo in $data; do
-                    echo "\"$repo\"," >> $git_attr_file
-                done
-                unset IFS
-                echo "]," >> $git_attr_file
-            done
-            echo "}" >> $git_attr_file
-        fi
-        for cache in pkg gem raw_pkg file git_repo; do
+        for cache in pkg gem raw_pkg file; do
             checker="barclamp_${cache}_cache_needs_update"
             updater="update_barclamp_${cache}_cache"
             [[ $(type $checker) = "$checker is a function"* ]] || \

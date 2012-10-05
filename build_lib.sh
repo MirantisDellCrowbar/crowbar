@@ -21,7 +21,6 @@ declare -A BC_DEPS BC_GROUPS BC_PKGS BC_EXTRA_FILES BC_OS_DEPS BC_GEMS
 declare -A BC_REPOS BC_PPAS BC_RAW_PKGS BC_BUILD_PKGS BC_QUERY_STRINGS
 declare -A BC_SMOKETEST_DEPS BC_SMOKETEST_TIMEOUTS BC_BUILD_CMDS
 declare -A BC_SUPERCEDES BC_SRC_PKGS
-declare -A BC_GIT_REPOS
 
 # Build OS independent query strings.
 BC_QUERY_STRINGS["deps"]="barclamp requires"
@@ -33,7 +32,6 @@ BC_QUERY_STRINGS["gems"]="gems pkgs"
 BC_QUERY_STRINGS["test_deps"]="smoketest requires"
 BC_QUERY_STRINGS["test_timeouts"]="smoketest timeout"
 BC_QUERY_STRINGS["supercedes"]="barclamp supercedes"
-BC_QUERY_STRINGS["git_repos"]="git_repos"
 
 # By default, do not try to update the cache or the metadata.
 # These will be unset if --update-cache is passed to the build.
@@ -69,7 +67,6 @@ get_barclamp_info() {
                     src_pkgs) is_in "$line" ${BC_SRC_PKGS["$bc"]} || \
                         BC_SRC_PKGS["$bc"]+="$line ";;
                     extra_files) BC_EXTRA_FILES["$bc"]+="$line\n";;
-                    git_repos) BC_GIT_REPOS["$bc"]+="$line\n";;
                     os_support) BC_OS_SUPPORT["$bc"]+="$line ";;
                     gems) BC_GEMS["$bc"]+="$line ";;
                     repos|os_repos) BC_REPOS["$bc"]+="$line\n";;
@@ -610,30 +607,6 @@ update_barclamp_file_cache() {
     done < <(write_lines "${BC_EXTRA_FILES[$1]}")
 }
 
-# Fetch git repos that we do not already have.
-update_barclamp_git_repo_cache() {
-    local dest url git_repo bc_cache="$CACHE_DIR/barclamps/$1/git_repos"
-    # Fetch any git_repos we need.
-    mkdir -p "$bc_cache"
-    while read git_repo; do
-        dest=${git_repo#* }
-        url=${git_repo%% *}
-        [[ -f $bc_cache/git_repos/$dest/${git_repo##*/} ]] && continue
-        echo "Cloning $git_repo:"
-        git clone --mirror $url $bc_cache/$dest.git || \
-            die "Could not clone git repo from $url"
-        echo "Compressing $bc_cache/$dest.git to $bc_cache/$dest.tar.bz2:"
-        local cwd=`pwd`
-        cd $bc_cache
-        tar cjf $dest.tar.bz2 $dest.git/ || \
-            die "Could not compress directory $bc_cache/$dest.git"
-        cd $cwd
-        echo "Cleaning the $bc_cache/$dest.git:"
-        rm -fr $bc_cache/$dest.git
-        in_cache git add "$bc_cache/$dest.tar.bz2"
-    done < <(write_lines "${BC_GIT_REPOS[$1]}")
-}
-
 # Check to see if the barclamp package cache needs update.
 barclamp_pkg_cache_needs_update() {
     local pkg pkgname arch bcs=() bc
@@ -709,19 +682,6 @@ barclamp_file_cache_needs_update() {
         pkg=${pkg%% *}
         [[ -f $bc_cache/$dest/${pkg##*/} ]] || return 0
     done < <(write_lines "${BC_EXTRA_FILES[$1]}")
-    return 1
-}
-
-# Check to see if we are missing any git repos.
-barclamp_git_repo_cache_needs_update() {
-    local dest url git_repo bc_cache="$CACHE_DIR/barclamps/$1/git_repos"
-    mkdir -p "$bc_cache"
-    # Fourth, check to make sure we have all the git_repos we need.
-    while read git_repo; do
-        dest=${git_repo#* }
-        url=${git_repo%% *}
-        [[ -f $bc_cache/$dest.tar.bz2 ]] || return 0
-    done < <(write_lines "${BC_GIT_REPOS[$1]}")
     return 1
 }
 
