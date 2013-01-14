@@ -51,6 +51,11 @@ fi
 # Always run in verbose mode for now.
 VERBOSE=true
 
+unset CROWBAR_BUILD_PID
+# Source our common build functions
+. "$CROWBAR_DIR/build_lib.sh" || exit 1
+. "$CROWBAR_DIR/test_lib.sh" || exit 1
+
 # OS to stage Sledgehammer on to.  Defaults to CentOS 6.2
 [[ $SLEDGEHAMMER_OS ]] || SLEDGEHAMMER_OS="centos-6.2"
 OS_TO_STAGE="$SLEDGEHAMMER_OS"
@@ -75,17 +80,13 @@ mkdir -p "$CACHE_DIR" "$IMAGE_DIR" "$CHROOT"
 # Location of the Crowbar checkout we are building from.
 [[ $CROWBAR_DIR ]] || CROWBAR_DIR="${0%/*}"
 [[ $CROWBAR_DIR = /* ]] || CROWBAR_DIR="$currdir/$CROWBAR_DIR"
-[[ -f $CROWBAR_DIR/build_crowbar.sh && -d $CROWBAR_DIR/.git ]] || \
+[[ -f $CROWBAR_DIR/build_sledgehammer.sh && -d $CROWBAR_DIR/.git ]] || \
     die "$CROWBAR_DIR is not a git checkout of Crowbar!"
 export CROWBAR_DIR
 
 # Directory that holds our Sledgehammer PXE tree.
 [[ $SLEDGEHAMMER_PXE_DIR ]] || SLEDGEHAMMER_PXE_DIR="$CACHE_DIR/tftpboot"
 
-unset CROWBAR_BUILD_PID
-# Source our common build functions
-. "$CROWBAR_DIR/build_lib.sh" || exit 1
-. "$CROWBAR_DIR/test_lib.sh" || exit 1
 
 # Make sure that we actually know how to build the ISO we were asked to
 # build.  If we do not, print a helpful error message.
