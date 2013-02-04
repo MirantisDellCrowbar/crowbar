@@ -37,12 +37,15 @@ def update_paths
     @MODEL_SOURCE = File.join @CROWBAR_PATH, 'barclamp_model'
   end
   @BIN_PATH = File.join @BASE_PATH, 'bin'
+  @SETUP_PATH = File.join @BASE_PATH, 'bin'
   @UPDATE_PATH = '/updates'
   @ROOT_PATH = '/'
 end
 
 @@debug = ENV['DEBUG'] === "true"
 @@base_dir = "/opt/dell"
+@@no_framework = false
+@@no_migrations = false
 @@no_chef = false
 @@no_files = false
 
@@ -50,23 +53,29 @@ def debug(msg)
   puts "DEBUG: " + msg if @@debug
 end
 
-def fatal(msg, log)
-  puts "ERROR: #{msg}  Aborting; examine #{log} for more info."
+def fatal(msg, log=nil)
+  m = "ERROR: #{msg}  Aborting"
+  m ="#{m}; examine #{log} for more info."  if log
+  puts m
   exit 1
 end
 
 # entry point for scripts
 def bc_install(bc, bc_path, yaml)
-  case yaml["crowbar"]["layout"].to_i
-  when 1
+  case yaml["crowbar"]["layout"].to_s
+  when "1"
     throw "ERROR: Crowbar 1.x barclamp formats are not supported in Crowbar 2.x"
-  when 2
+  when "1.9","2"
     debug "Installing app components"
-    bc_install_layout_2_app bc, bc_path, yaml
+    bc_install_layout_2_app bc, bc_path, yaml unless @@no_framework
+    debug "Running database migrations"
+    bc_install_layout_2_migrations bc, bc_path, yaml unless @@no_migrations
     debug "Installing chef components" unless @@no_chef
     bc_install_layout_1_chef bc, bc_path, yaml unless @@no_chef
     debug "Installing cache components" unless @@no_files
     bc_install_layout_1_cache bc, bc_path unless @@no_files
+    debug "Performing install actions"
+    bc_do_install_action bc, bc_path, :install
   else
     throw "ERROR: could not install barclamp #{bc} because #{barclamp["barclamp"]["crowbar_layout"]} is unknown layout."
   end
@@ -94,18 +103,19 @@ def catalog(bc_path)
   end
 end
 
+
 # copies paths from one place to another (recursive)
 def bc_cloner(item, bc, entity, source, target, replace)
+  # Replace: ONLY used when creating a new barclamp from the model!
   debug "bc_cloner method called with debug option enabled"
   debug "bc_cloner args: item=#{item}, bc=#{bc}, entity=#{entity}, source=#{source}, target=#{target}, replace=#{replace}"
 
   files = []
   new_item = (replace ? bc_replacer("#{item}", bc, entity) : item)
-  debug "new_item=#{new_item}"
   new_file = File.join target, new_item
-  debug "new_file=#{new_file}"
   new_source = File.join(source, item)
-  debug "new_source=#{new_source}"
+  debug "\tnew_source=#{new_source}"
+  debug "\tnew_target=#{new_file} (item is #{new_item})"
   if File.directory? new_source
     debug "\tcreating directory #{new_file}."
     FileUtils.mkdir new_file unless File.directory? new_file
@@ -114,11 +124,12 @@ def bc_cloner(item, bc, entity, source, target, replace)
       files += bc_cloner(recurse, bc, entity, new_source, new_file, replace)
     end
   else
-    #need to inject into the file
+    #need to inject into the file (normal copy)
     unless replace
-      debug "\t\tcopying file #{new_file}."
+      debug "\t\tcopying file to #{new_file}."
       FileUtils.cp new_source, new_file
       files << new_file
+    #we need to scrub the file for replacement strings
     else
       debug "\t\tcreating file #{new_file}."
       t = File.open(new_file, 'w')
@@ -220,29 +231,50 @@ def merge_sass(yaml, bc, path, installing)
   end
 end
 
-# cleanup (anti-install) assumes the install generates a file list
-def bc_remove_layout_1(bc, bc_path, yaml)
-  filelist = File.join @BARCLAMP_PATH, "#{bc}-filelist.txt"
-  if File.exist? filelist
-    files = [ filelist ]
-    File.open(filelist, 'r') do |f|
-      f.each_line { |line| files << line }
-    end
-    FileUtils.rm files
-    merge_nav yaml, false
-    merge_sass yaml, bc, bc_path, false
-    debug "Barclamp #{bc} UNinstalled"
-  end
-end
-
 def framework_permissions(bc, bc_path)
-  FileUtils.chmod 0755, File.join(@CROWBAR_PATH, 'db')
-  chmod_dir 0644, File.join(@CROWBAR_PATH, 'db')
-  FileUtils.chmod 0755, File.join(@CROWBAR_PATH, 'db', 'migrate')
-  FileUtils.chmod 0755, File.join(@CROWBAR_PATH, 'tmp')
-  chmod_dir 0644, File.join(@CROWBAR_PATH, 'tmp')
+  if File.exists?(File.join(@CROWBAR_PATH, 'db'))
+    FileUtils.chmod 0755, File.join(@CROWBAR_PATH, 'db')
+    chmod_dir 0644, File.join(@CROWBAR_PATH, 'db')
+    FileUtils.chmod 0755, File.join(@CROWBAR_PATH, 'db', 'migrate')
+  end
+  if File.exists?(File.join(@CROWBAR_PATH, 'tmp'))
+    FileUtils.chmod 0755, File.join(@CROWBAR_PATH, 'tmp')
+    chmod_dir 0644, File.join(@CROWBAR_PATH, 'tmp')
+  end
   debug "\tcopied crowbar_framework files"
 end
+
+
+# perform install actions for the barclamp
+# look for setup/* files and execute the appropriate ones, in order, based on
+# the lifecycle stage the barclap is going through :
+#  :install - IXXX
+#  :update - UXXX
+#
+# The XXX is sorted, and the scripts are executed in order.
+# The crowbar reserves the ranges 0-9 and 50-9.
+# Other params:
+#   bc - the barclamps name
+#   bc_path - the full path for the barclamp's files
+def bc_do_install_action(bc,bc_path, stage)
+  suffix = ""
+  case stage
+  when :install then suffix="install"
+  when :remove then  suffix="remove"
+  else
+    fatal("unknown barclamp lifecycle stage: #{stage}")
+  end
+  actions = []
+  Dir.glob(File.join(bc_path,"setup","*.#{suffix}")) { |x| actions << x}
+  actions.sort!
+  debug("actions to perform: #{actions.join(' ')}")
+  actions.each { |action| 
+    fatal("action #{action} not found for #{bc}") unless File.exists?(action)
+    output = `#{action} 2>&1`
+    fatal("action #{action} failed for #{bc}:\n #{output}") unless $? == 0
+  }   
+end
+
 
 # install the framework files for a barclamp
 def bc_install_layout_2_app(bc, bc_path, yaml)
@@ -255,6 +287,7 @@ def bc_install_layout_2_app(bc, bc_path, yaml)
   #copy the rails parts (required for render BEFORE import into chef)
   dirs = Dir.entries(bc_path)
   debug "path entries #{dirs.pretty_inspect}"
+
   if dirs.include? 'crowbar_framework'
     debug "path entries include \"crowbar_framework\""
     files += bc_cloner('crowbar_framework', bc, nil, bc_path, @BASE_PATH, false)
@@ -264,12 +297,15 @@ def bc_install_layout_2_app(bc, bc_path, yaml)
   debug "merge_sass"
   merge_sass yaml, bc, bc_path, true
 
-  if dirs.include? 'bin'
-    debug "path entries include \"bin\""
-    files += bc_cloner('bin', bc, nil, bc_path, @BASE_PATH, false)
-    FileUtils.chmod_R 0755, @BIN_PATH
-    debug "\tcopied command line files"
-  end
+  {'bin'=>@BIN_PATH, 'setup' =>@SETUP_PATH}.each { |k,v|
+    if dirs.include? k
+      debug "path entries include \"#{k}\""
+      files += bc_cloner(k, bc, nil, bc_path, @BASE_PATH, false)
+      FileUtils.chmod_R 0755, v
+      debug "\tcopied files for #{k}"
+    end
+  }
+
   if dirs.include? 'updates' and !@@no_files
     debug "path entries include \"updates\""
     files += bc_cloner('updates', bc, nil, bc_path, @ROOT_PATH, false)
@@ -282,6 +318,26 @@ def bc_install_layout_2_app(bc, bc_path, yaml)
     debug "path entries include \"chef\""
     files += bc_cloner('chef', bc, nil, bc_path, @BASE_PATH, false)
     debug "\tcopied over chef parts from #{bc_path} to #{@BASE_PATH}"
+  end
+
+  # copy all the BDD files to the target
+  if dirs.include? 'BDD'
+    debug "path entries include \"BDD\""
+    files += bc_cloner('BDD', bc, nil, bc_path, @BASE_PATH, false)
+    debug "\tcopied over BDD parts from #{bc_path} to #{@BASE_PATH}"
+  end
+
+  # copy over docs
+  if dirs.include? 'doc'
+    doc_source = File.join(bc_path,'doc')
+    doc_target = File.join(@BASE_PATH,'doc',bc)
+    FileUtils.mkdir File.join(@BASE_PATH,'doc') unless File.directory? File.join(@BASE_PATH,'doc')
+    FileUtils.mkdir doc_target unless File.directory? doc_target
+    debug "Doc path entries from #{doc_source} to #{doc_target}"
+    files += bc_cloner('', bc, nil, doc_source, doc_target, false)
+    debug "\tcopied over Docs from #{doc_source} to #{doc_target}"
+  else
+    debug "\tno Docs to copy"
   end
 
   # Migrate base crowbar schema if needed
@@ -320,14 +376,19 @@ def bc_install_layout_2_app(bc, bc_path, yaml)
   template_file = File.join bc_path, "chef", "data_bags", "crowbar", "bc-template-#{bc}.json"
   schema_file = File.join bc_path, "chef", "data_bags", "crowbar", "bc-template-#{bc}.schema"
   new_template_file = File.join bc_path, "chef", "data_bags", "crowbar", "bc-template-#{bc}-new.json"
-  FileUtils.mkdir yml_path unless File.directory? yml_path
-  FileUtils.mkdir template_path unless File.directory? template_path
-  FileUtils.mkdir schema_path unless File.directory? schema_path
+  FileUtils.mkdir_p yml_path unless File.directory? yml_path
+  FileUtils.mkdir_p template_path unless File.directory? template_path
+  FileUtils.mkdir_p schema_path unless File.directory? schema_path
   FileUtils.cp yml_barclamp, File.join(yml_path, "#{bc}.yml")
   FileUtils.cp template_file, File.join(template_path, "", "bc-template-#{bc}.json") if File.exists? template_file
   FileUtils.cp schema_file, File.join(schema_path, "", "bc-template-#{bc}.schema") if File.exists? schema_file
   FileUtils.cp new_template_file, File.join(template_path, "", "bc-template-#{bc}-new.json") if File.exists? new_template_file
 
+  bc_layout = yaml["crowbar"]["layout"].to_i rescue 2
+  debug "Barclamp #{bc} (format v#{bc_layout}) added to Crowbar Framework.  Review #{filelist} for files created."
+end
+
+def bc_install_layout_2_migrations(bc, bc_path, yaml)
   #database migration
   bc_layout = yaml["crowbar"]["layout"].to_i rescue 2
   if bc_layout > 1
@@ -336,8 +397,6 @@ def bc_install_layout_2_app(bc, bc_path, yaml)
       debug "Database migration invoked - #{db}"
     end
   end
-  
-  debug "Barclamp #{bc} (format v#{bc_layout}) added to Crowbar Framework.  Review #{filelist} for files created."
 end
 
 # upload the chef parts for a barclamp
@@ -409,6 +468,7 @@ def upload_data_bags_from_rpm(rpm, rpm_files, bc_path, log)
     end
   end
 end
+
 
 def upload_roles_from_rpm(rpm, rpm_files, bc_path, log)
   roles_dir = "#{@BASE_PATH}/chef/roles"
