@@ -1,5 +1,6 @@
 #!/bin/bash
 
+
 export LANG="C"
 export LC_ALL="C"
 
@@ -30,7 +31,7 @@ github_re='^(https?|ssh|git)://.*github\.com/([^/]+)'
 
 # Associative array to handle skeleton of the state transition machine.
 # This is roughly a reverse lookup table for use by ci_get_state().
-# The state transition rules are implemented by ci_next_states()
+# The state transition rules are implemented by ci_all_next_states()
 declare -A CI_STATES
 CI_STATES["new"]="failed needs-work"
 CI_STATES["merge-testing"]="new"
@@ -90,6 +91,8 @@ gem list -i json &>/dev/null || \
     die "JSON gem not installed.  Please install it with gem install json."
 
 set -o pipefail
+shopt -s extglob
+shopt -s nullglob
 
 # A little wrapper for git to help people see what dev is doing.
 git() {
@@ -589,6 +592,7 @@ update_all_tracking_branches() {
     fi
 }
 
+# Helper for sourcing pull request data as variables.
 source_prq_vars() (
     # $1 = path to pull request metadata
     # $2 = whether to scope the variables as local
@@ -613,7 +617,6 @@ scrub_merged_pull_requests() {
     # $@ = branches to test for mergedness
     local br ref pull_req remote
     local -A to_remove pull_reqs heads
-    remote_available personal || return
     while read ref br; do
 	case $br in
 	    refs/heads/*)
@@ -968,11 +971,14 @@ sort_pull_requests() {
 # translate a pull request number (as displayed by dev pull-requests list)
 # into an internal ID.
 pull_request_number_to_id() {
-    if [[ $1 && $1 =~ [0-9]+ ]]; then
+    local idx id
+    if [[ $1 && $1 =~ ^[0-9]+$ ]]; then
         read idx id < <(grep "^$1 " "$OPEN_PULL_REQUESTS/pull_request_index")
         [[ $1 = $idx ]] || die "$1 is not a valid pull request." \
             "dev pull-requests list shows the open ones we know about."
     elif grep -q " $1\$" "$OPEN_PULL_REQUESTS/pull_request_index"; then
+        id="$1"
+    elif [[ -d $LOCAL_PULL_TRACKING/$1/ci_state ]]; then
         id="$1"
     else
         die "$1 is not a valid pull request ID"
@@ -980,6 +986,7 @@ pull_request_number_to_id() {
     echo $id
 }
 
+# Figure our which builds need to be built to test a given pull request
 builds_for_one_pull_request() {
     # $1 =path to pull request
     local -a builds
@@ -1078,8 +1085,8 @@ builds_for_pull_request() {
 
 # Show information for a pull request in human-readable format.
 show_pull_request() {
-    local idx id prq repo release target_account
-    local -a builds
+    local idx id prq repo release target_account state
+    local -a builds ci_states
     idx=$1
     id=$(pull_request_number_to_id $idx) || exit 1
     prq="$OPEN_PULL_REQUESTS/$id"
@@ -1105,12 +1112,24 @@ show_pull_request() {
         echo "Target Branch:       $prq_target_branch"
         echo "Pull Request URL:    $prq_github_url"
         echo "Builds:              ${builds[*]}"
+        if [[ -d $LOCAL_PULL_TRACKING/$id ]]; then
+            echo "Current CI States:"
+            while read state; do
+                echo "    $state"
+            done < <(ci_get_current_states "$id")
+        fi
     elif [[ $id = bundles/* ]]; then
         echo "Title:          $(cat "$prq/title")"
         echo "Release:        $(cat "$prq/release")"
         echo "Last Updated:   $(pull_request_last_touched "$id")"
         echo "Type:           bundle"
         echo "Bundle ID:      ${id##*/}"
+        if [[ -d $LOCAL_PULL_TRACKING/$id ]]; then
+            echo "Current CI States:"
+            while read state; do
+                echo "    $state"
+            done < <(ci_get_current_states "$id")
+        fi
         local repo
         for repo in "$prq/"*; do
             [[ -d $repo ]] || continue
@@ -1147,7 +1166,6 @@ list_pull_requests() {
     done <"$OPEN_PULL_REQUESTS/pull_request_index"
 }
 
-
 pull_request_checkout_one() (
     . <(source_prq_vars "$1" "local")
     case $prq_local_repo in
@@ -1155,7 +1173,7 @@ pull_request_checkout_one() (
         crowbar) cd "$CROWBAR_DIR";;
     esac
     debug "$prq_local_repo: Checking out $prq_local_branch"
-    quiet_checkout "$(git rev-parse "$prq_local_branch")" || \
+    quiet_checkout "$prq_local_branch" || \
         die "Could not checkout $prq_local_branch!"
 )
 
@@ -1166,8 +1184,10 @@ pull_request_switch_one() (
         crowbar) cd "$CROWBAR_DIR";;
     esac
     pull_request_checkout_one "$1" || exit 1
-    git merge "$(git rev-parse "$prq_target_branch")" || \
-        die "Could not merge $prq_target_branch into $prq_local_branch!"
+    git checkout "$(git rev-parse HEAD)"
+    git merge "$(git rev-parse "$prq_target_branch")" && return 0
+    git merge --abort
+    die "Could not merge $prq_target_branch into $prq_local_branch!"
 )
 
 # Switch to a specific build in a pull request.
@@ -1245,6 +1265,8 @@ pull_request_merge_one () {
     fi
 }
 
+# Check out the branches specific to a pull request.
+# Unlike pull-requests merge, this leaves you on actual branches.
 pull_request_checkout() {
     # $1 = index
     local id res=0 repo
@@ -1278,6 +1300,7 @@ pull_request_checkout() {
     fi
 }
 
+# Have Github merge all the changes in a pull request bundle.
 pull_request_merge() {
     # $1 = index
     local id res=0 repo
@@ -1318,6 +1341,7 @@ pull_request_comment_one() {
         "https://api.github.com/repos/$prq_target_account/$prq_local_repo/issues/$prq_number/comments"
 }
 
+# Add a comment to a pull request.
 pull_request_comment() {
     # $1 = pull request number
     # $2 = body of comment
@@ -1344,6 +1368,7 @@ pull_request_close_one() {
         "https://api.github.com/repos/$prq_target_account/$prq_local_repo/pulls/$prq_number"
 }
 
+# Close a pull request without merging it.
 pull_request_close() {
     # $1 = pull request number
     # $2 = closing comment
@@ -1359,37 +1384,198 @@ pull_request_close() {
     esac
 }
 
+# Helper function for trying to do something with the CI system and push out the results.
+# The thing to do should be idempotent.
+ci_do_and_push() {
+    while true; do
+        "$@" || return $?
+        push_ci_tracking
+        local __res=$?
+        case $__res in
+            0) return 0;;
+            1) continue;;
+            2) die "No local pull tracking repository!";;
+            3) die "Could not find remote to push CI tracking to!";;
+            128) die "Could not talk to upstream CI tracking remote!";;
+            *) return $__res;;
+        esac
+    done
+}
+
+# Fetch CI tracking information and try to merge it with any local information
+# that has not been pushed upstream.  If we cannot merge, we throw away the
+# local changes and let the caller know that we failed to merge local changes.
 fetch_ci_tracking() (
     [[ ! -d $LOCAL_PULL_TRACKING ]] && mkdir -p "$LOCAL_PULL_TRACKING"
-    cd "$LOCAL_PULL_TRACKING"
-    if [[ ! -d .git ]]; then
+    if [[ ! -d $LOCAL_PULL_TRACKING/.git ]]; then
         for remote in "${DEV_SORTED_REMOTES[@]}"; do
             remote_available "$remote" || continue
             test_remote "${DEV_REMOTE_URLBASE[$remote]}/$CI_TRACKING_REPO" || continue
-            debug "Fetching CI repository from ${remote}"
-            git clone -o "$remote" "${DEV_REMOTE_URLBASE[$remote]}/$CI_TRACKING_REPO" . &>/dev/null
-            break
+            git clone -o "$remote" \
+                "${DEV_REMOTE_URLBASE[$remote]}/$CI_TRACKING_REPO" \
+                "$LOCAL_PULL_TRACKING" || return 2
+            return 0
         done
-    else
-        debug "Updating local CI tracking repository"
-        git pull --all --force &>/dev/null
+        return 2
     fi
+    cd "$LOCAL_PULL_TRACKING"
+    git fetch -q --all || return 128
+    quiet_checkout -f master
+    remote=$(git config --get branch.master.remote) || return 3
+    exec &>/dev/null
+    if branches_synced "." "$remote/master" "master"; then
+	git reset --hard "$remote/master"
+        git clean -f -d
+	return 0
+    fi
+    git rebase "$remote/master" master && return 0
+    git rebase --abort
+    git reset --hard "$remote/master"
+    git clean -f -d
+    return 1
 )
 
-__ci_set_status() (
+# Push CI tracking to the upstream repository.
+push_ci_tracking() (
+    local remote
+    fetch_ci_tracking || return $?
+    cd "$LOCAL_PULL_TRACKING"
+    remote=$(git config --get branch.master.remote) || return 3
+    git push -q "$remote" "master:master"
+    local __res=$?
+    (( $__res > 127 || $__res == 0 )) && return $res
+)
+
+# Get all the IDs that the pull request system knows about.
+ci_ids() {
+    local id ids=()
+    ids=("$LOCAL_PULL_TRACKING/bundles/"* "$LOCAL_PULL_TRACKING/singletons/"*/*/*)
+    for id in "${ids[@]}"; do
+        echo "${id#$LOCAL_PULL_TRACKING/}"
+    done
+}
+
+ci_filtered_ids() {
+    local id state test_state
+    local -a ids states
+    while read id; do
+        states=()
+        while read state; do
+            states+=("$state")
+        done < <(ci_get_current_states "$id")
+        for state in "${states[@]}"; do
+            for test_state in "$@"; do
+                [[ $test_state = $state* ]] || continue
+                ids+=("$id")
+                break 2
+            done
+        done
+    done < <(ci_ids)
+    __random_order "${ids[@]}"
+}
+
+# Get all the pull request IDs that are not closed or merged.
+ci_open_ids() {
+    local id
+    local -a ids
+    while read id; do
+        local state=$(ci_get_current_states "$id")
+        [[ $state = closed || $state = merged || \
+            $state = failed || $state = needs-work ]] && continue
+        ids+=("$id")
+    done < <(ci_ids)
+    __random_order "${ids[@]}"
+}
+
+__ci_set_state() (
     # $1 = id
-    # $2 = status
-    # $3 = old status
-    # $4 = comment
+    # $2 = state
+    # $3 = comment
     cd "$LOCAL_PULL_TRACKING/$1" || die "$1 is not being tracked by CI"
-    status="ci_status/$(date -u +%Y-%m-%dT%TZ)/$DEV_GITHUB_ID/$2"
-    mkdir -p "$status"
-    echo "$3" >"$status/last_state"
-    echo "$4" >"$status/comment"
+    state="ci_state/$2"
+    mkdir -p "$state"
+    echo "$3" >>"$state/comment"
+    git add "$state"
+    git commit -m "Added state $2 to $1"
 )
 
-# Figure out the set of possible next states from the current state
-ci_next_states() {
+# Find the states that the current state transitioned from.
+ci_last_states() {
+    # $1 = pull request ID
+    # $2 = state
+    [[ -d $LOCAL_PULL_TRACKING/$1 ]] || \
+        die "$1 is not a CI tracked pull request!"
+    local state_dir="$LOCAL_PULL_TRACKING/$1/ci_state/$2"
+    [[ -d $state_dir ]] || \
+        die "$2 is not a state in $1"
+    [[ -d $state_dir/last_states ]] || return 0
+    local sfile state
+    while read -r state; do
+        state=${state#./}
+        state=${state%/.last}
+        echo "$state"
+    done < <(cd "$state_dir/last_states"; find -name .last -type f)
+}
+
+__ci_state_walker() {
+    local state this_states=()
+    while read -r state; do
+        [[ ${states[$state]} ]] && continue
+        states["$state"]="$3"
+        this_states+=("$state")
+    done < <(ci_last_states "$1" "$2")
+    [[ $this_states ]] || return 0
+    for state in "${this_states[@]}"; do
+        __ci_state_walker "$1" "$state" "$(( ${3} + 1))"
+    done
+}
+
+ci_all_last_states() {
+    # $1 = pull request ID
+    # $2 = starting state
+    local -A states
+    __ci_state_walker "$1" "$2" 0
+    (( ${#states[@]} == 0 )) && return 0
+    printf "%s\n" "${!states[@]}"
+}
+
+# Link an old state to a new one.  This function is responsible for
+# making sure that the overall state transition graph remains sane.
+ci_link_state() {
+    # $1 = pull request ID
+    # $2 = old state
+    # $3 = new state
+    [[ -d $LOCAL_PULL_TRACKING/$1/ci_state ]] || \
+        die "$1 is not being tracked by the CI system!"
+    local state_dir="$LOCAL_PULL_TRACKING/$1/ci_state"
+    [[ -d $state_dir/$2 ]] || \
+        die "$1 does not have old state $2"
+    [[ -d $state_dir/$3 ]] || \
+        die "$1 does not have new state $3"
+    [[ $2 != $3 ]] || \
+        die "$1: Cannot link $2 to itself!"
+    local state
+    # Check to see if this link already exists.
+    # If it does, we just succeed without doing anything.
+    [[ -f $state_dir/$3/last_states/$2 ]] && return 0
+    # Check to see if adding this link would make the graph cyclical.
+    # If it will, just die.
+    while read -r state; do
+        [[ $state = $3 ]] && \
+            die "$1: Linking $2 to $3 would create a cyclical state graph!"
+    done < <(ci_all_last_states "$1" "$2")
+    mkdir -p "$LOCAL_PULL_TRACKING/$1/ci_state/$3/last_states/$2"
+    touch "$LOCAL_PULL_TRACKING/$1/ci_state/$3/last_states/$2/.last"
+    (   cd "$LOCAL_PULL_TRACKING/$1/ci_state"
+        git add "$3/last_states/$2/.last"
+        git commit -m "Made state $3 a child of $2 in $1")
+}
+
+
+# Figure out the set of possible next states from the current state.
+# This may not be the same as the next states we will wind up transitioning to.
+# It is also the reference for what states the CI state machine can be in.
+ci_all_next_states() {
     # $1 = index or local ID.
     # $2 = current state
     local -A unit_test_whitelist
@@ -1403,7 +1589,21 @@ ci_next_states() {
     [[ -d $LOCAL_PULL_TRACKING/$id ]] || \
         die "Pull request $1 has not been imported into CI." \
         "Please run $0 ci import."
-    [[ $2 ]] && current_state=$2 || current_state=$(ci_get_state $id)
+    if [[ $2 ]]; then
+        current_state="${2}"
+    else
+        local states=()
+        while read current_state; do
+            states+=("$current_state")
+        done < <(ci_get_current_states "$id")
+        if (( ${#states[@]} > 1)); then
+            die "Pull request $1 is in more than one state:" \
+                "${states[@]}" \
+                "Please pass one of these to next-states"
+        fi
+        current_state="${states[0]}"
+    fi
+    read -r release < "$LOCAL_PULL_TRACKING/$id/release"
     case $current_state in
         # The first two states are fairly simple in their allowed transitions.
         new) next=(merge-testing);;
@@ -1413,37 +1613,37 @@ ci_next_states() {
         # depends on the whitelist.
         merge-tested)
             while read build oses; do
-                build=${build%:}
-                if [[ ${unit_test_whitelist[$release]} ]]; then
-                    next+=("unit-testing-$build")
+                build="${build%:}"
+                if [[ ${unit_test_whitelist["$release"]} ]]; then
+                    next+=("unit-testing $build")
                 else
                     for os in $oses; do
-                        next+=("build-testing-$build/$os")
+                        next+=("build-testing $build $os")
                     done
                 fi
             done < <(builds_for_pull_request "$id");;
         # unit testing happens on a per-release and per-build basis.
-        unit-testing-*)
-            build=${2#unit-testing-}
-            next=("unit-tested-$build");;
-        unit-tested-*)
-            local b=${2#unit-tested-}
+        unit-testing*)
+            build="${current_state#* }"
+            next=("unit-tested $build");;
+        unit-tested*)
+            build="${current_state#* }"
             while read build oses; do
                 build=${build%:}
                 if [[ $build != $b ]]; then continue; fi
-                next+=("build-testing-$build/$os")
+                next+=("build-testing $build $os")
             done < <(builds_for_pull_request "$id");;
         # Build and smoke tests happen on a release/build/os basis.
-        build-testing-*)
-            build=${2#build-testing-}
-            next=("build-tested-$build");;
-        build-tested-*)
-            build=${2#build-tested-}
-            next=("smoke-testing-$build");;
-        smoke-testing-*)
-            build=${2#smoke-testing-}
-            next=("smoke-tested-$build");;
-        smoke-tested-*) next=(code-reviewing);;
+        build-testing*)
+            build="${current_state#* }"
+            next=("build-tested $build");;
+        build-tested*)
+            build="${current_state#* }"
+            next=("smoke-testing $build");;
+        smoke-testing*)
+            build="${current_state#* }"
+            next=("smoke-tested $build");;
+        smoke-tested*) next=(code-reviewing);;
         # code-reviewing can actaully happen in parallel with the above
         # steps.
         code-reviewing) next=(code-reviewed);;
@@ -1451,64 +1651,391 @@ ci_next_states() {
         # Mergeable cannot happen until we have a sufficient number of code-reviewed states
         # and we have smoke-tested states for all the release/build/OS combos applicable.
         mergeable) next=(merged);;
-        merged) next=(closed);;
         failed|needs-work) next=(new);;
-        closed) next=();;
+        # Merged and closed are terminal states.
+        # Nothing else can happen to them.
+        merged|closed) next=();;
         *) die "Unknown state $current_state!";;
     esac
     printf "%s\n" "${next[@]}"
 }
 
+# Print any passed args in pseudo-random order
+__random_order() {
+    local -a res
+    local k v
+    for v in "$@"; do
+        k="$RANDOM"
+        while [[ ${res[$k]} ]]; do k="$RANDOM"; done
+        res[$k]="$v"
+    done
+    printf "%s\n" "${res[@]}"
+}
 
-# Get the state paths relative to an entry in the CI state tracking repo.
-# This is intended to be used by the backend machinery to implement the real
-# state transitions.
-ci_get_current_state_paths() {
+# Wrapper around ci_all_next_states that filters out next states that have
+# an intent registered for them, and prints them in random order.
+ci_next_states() {
+    local state id state_dir
+    local -a states
+    id=$(pull_request_number_to_id "$1") || \
+        die "$1 is not a valid pull request!"
+    [[ -d $LOCAL_PULL_TRACKING/$id ]] || \
+        die "Pull request $1 has not been imported into CI." \
+        "Please run $0 ci import."
+    state_dir="$LOCAL_PULL_TRACKING/$id/ci_state/$2"
+    while read -r state; do
+        [[ -d $state_dir/intents/$state/timeout ]] && continue
+        states+=("$state")
+    done < <(ci_all_next_states "$id" "$2")
+    __random_order "${states[@]}"
+}
+
+# Get the current states that a given pull request in the CI is currently in.
+# In the interest of parallelization, a pull request can be in multiple CI
+# states at any given time.
+ci_get_current_states() {
     # $1 = pull request ID.
-    local st_re='^\./([^/]+)/([^/]+)/([^/]+)$'
-    local state_dir state last_state
+    local state_dir state last_state last_state_file id
     local -A states
-    id=$(pull_request_number_to_id "$1") || exit 1
-    [[ -d $LOCAL_PULL_TRACKING/$id ]] || die "$1 is not being tracked by CI"
+    id=$(pull_request_number_to_id "$1") || \
+        die "$1 is not a valid pull request!"
+    [[ -d $LOCAL_PULL_TRACKING/$id/ci_state ]] || die "$id is not being tracked by CI"
     # First, read all of the state paths in.
     while read state_dir; do
-        [[ $state_dir =~ $st_re ]] || die "Malformed state in ci_get_state"
-        states[${state_dir#./}]=current
-    done < <(cd "$LOCAL_PULL_TRACKING/$id/ci_status"; find . -mindepth 3 -maxdepth 3 -type d)
+        state_dir="${state_dir%/comment}"
+        state_dir="${state_dir%/last_states}"
+        states[${state_dir##*/ci_state/}]=current
+    done < <(find "$LOCAL_PULL_TRACKING/$id/ci_state/" -type f -and -name comment -or -type d -and -name last_states)
     # Second, mask out all of the states that have a last file pointing at them.
+    # This needs to be ornate-ified to handle per-state special conditions.
     for state in "${!states[@]}"; do
-        [[ -f $LOCAL_PULL_TRACKING/$id/$state/last_state ]] || continue
-        read -r last_state < "$LOCAL_PULL_TRACKING/$id/$state/last_state"
-        [[ ${state[$last_state]} ]] || \
-            die "State graph for CI item $id is invalid." \
-            "State $state says that it transitioned from $last_state," \
-            "but $last_state is not in the state graph!"
-        state[$last_state]=stale
+	# If this state has no last_states, then it is current.
+	[[ -d $LOCAL_PULL_TRACKING/$id/ci_state/$state/last_states ]] || continue
+	# If we have intents, and some of them are unfulfilled,
+	# we are not stale.
+	if [[ -d $LOCAL_PULL_TRACKING/$id/ci_state/$state/intents ]]; then
+	    local next_state
+	    while read -r next_state; do
+		next_state=${next_state##*/intents/}
+		next_state=${next_state%/timeout}
+		next_state=${next_state%/.intent}
+		# if $next_state is not a directory under ci_state,
+	        #then this intent is not filled.
+		[[ -d $LOCAL_PULL_TRACKING/$id/ci_state/$next_state ]] && continue
+		states["$state"]=unfilled
+		continue 2
+	    done < <(find "$LOCAL_PULL_TRACKING/$id/ci_state/$state/intents" -name timeout -or -name .intent)
+	    states["$state"]=stale
+	fi
+        while read -r last_state; do
+	    # Sanity-check the state transition graph.
+            [[ ${states[$last_state]} ]] || \
+                die "State graph for CI item $id is invalid." \
+                "State $state says that it transitioned from $last_state," \
+                "but $last_state is not in the state graph!"
+	    # If any of the last states have intents, and those intents are not filled,
+	    # then don't set that last state as stale.
+	    [[ ${states["$last_state"]} = unfilled ]] && continue
+	    # If we get this far, $last_state is stale.
+            states[$last_state]=stale
+        done < <(ci_last_states "$id" "$state")
     done
     # Anything not marked as stale is a state that we are in.
+    local -A active_states
     for state in "${!states[@]}"; do
-        [[ ${states[$state]} = stale ]] && continue
-        echo "$state"
+        [[ ${states["$state"]} = stale ]] && continue
+	active_states["$state"]="${states[$state]}"
+    done
+    # See if we are in one of the terminal states
+    for last_state in closed failed needs-work merged new; do
+        for state in "${!active_states[@]}"; do
+            [[ $state = $last_state ]] || continue
+            echo "$state"
+            return
+        done
+    done
+    __random_order "${!active_states[@]}"
+}
+
+ci_kill_stale_intents() (
+    # $1 = pull request ID
+    [[ -d $LOCAL_PULL_TRACKING/$1/ci_state ]] || return 1
+    cd "$LOCAL_PULL_TRACKING/$1/ci_state"
+    local intent need_commit=false
+    while read intent; do
+        [[ $intent = */intents/* ]] || continue
+	intent=${intent%/timeout}
+        local from=${intent%/intents/*}
+        from="${from#./}"
+        local to=${intent#*/intents/}
+        [[ -d $to ]] && continue
+        (( $(cat "$intent/timeout") >= $(date -u '+%s'))) && continue
+	[[ -f $intent/.intnet ]] || {
+	    touch "$intent/.intent"
+	    git add "$intent/.intent"
+	}
+        (cd "$intent"; git rm -f timeout +([[:xdigit:]]))
+        need_commit=true
+    done < <(find -name timeout -type f)
+    [[ $need_commit = true ]] || return 1
+    git commit -q -m "Killed stale intents for $1"
+)
+
+ci_register_intent() {
+    # $1 = pull request ID
+    # $2 = current state
+    # $3 = intended next state
+    # $4 = timeout for intent.  Defaults to 5 hours.
+    local timeout="${4:-18000}" id prq state state_ok=false
+    id=$(pull_request_number_to_id "$1") || \
+        die "$1 is not a valid pull request!"
+    [[ -d $LOCAL_PULL_TRACKING/$id ]] || \
+        die "Pull request $1 has not been imported into CI." \
+        "Please run $0 ci import."
+    prq="$LOCAL_PULL_TRACKING/$id"
+    [[ -d $prq/ci_state/$2 ]] || {
+        debug "$id does not have state $2, cannot register an intent to move to $3"
+        return 1
+    }
+    [[ -d $prq/ci_state/$3 ]] && {
+        debug "$id already has state $3"
+        return 1
+    }
+    while read state; do
+        [[ $state = $2 ]] || continue
+        state_ok=true
+        break
+    done < <(ci_get_current_states "$1")
+    [[ $state_ok = true ]] || \
+        die "$id is not in state $2, cannot register an intent for it."
+    state_ok=false
+    while read state; do
+        [[ $state = $3 ]] || continue
+        state_ok=true
+        break
+    done < <(ci_all_next_states "$id" "$2")
+    [[ $state_ok = true ]] || \
+        die "$id: State $2 does not have a next state of $3, cannot register an intent."
+    # See if we need to expire intents on the current state.
+    if [[ -f $prq/ci_state/$2/intents/$3/timeout ]]; then
+        ci_kill_stale_intents "$id" && push_ci_tracking && \
+            [[ ! -f $prq/ci_state/$2/intents/$3/timeout ]] || return 1
+    fi
+    mkdir -p "$prq/ci_state/$2/intents/$3/"
+    local intent_id=$((ip addr show; date -u "+%s%N"; printf "$RANDOM") |sha1sum -)
+    intent_id="${intent_id%% *}"
+    echo "$(( $(date -u '+%s') + ${timeout} ))" > "$prq/ci_state/$2/intents/$3/timeout"
+    touch "$prq/ci_state/$2/intents/$3/$intent_id"
+    touch "$prq/ci_state/$2/intents/$3/.intent" # Solely to keep git from nuking the dir.
+    (   cd "$prq/ci_state/$2/intents/$3/"
+        git add .
+        git commit -m "Registered intent to transition $id from $2 to $3") &>/dev/null
+    echo "$intent_id"
+}
+
+ci_handle_intent() {
+    # $1 = intent ID
+    # $2 = passed or failed
+    local -a intents states
+    local intent state
+    while read -r intent; do
+        intents+=("$intent")
+    done < <(find "$LOCAL_PULL_TRACKING/singletons" "$LOCAL_PULL_TRACKING/bundles" \
+        -name "$1" -type f) 2>/dev/null
+    [[ ${intents[1]} ]] && \
+        die "More than one intent with id $1 found. This should never happen." \
+        "${intents[@]}"
+    intent="${intents[0]#$LOCAL_PULL_TRACKING/}"
+    local prq="${intent%%/ci_state/*}"
+    intent="${intent#${prq}/ci_state/}"
+    local current_state=${intent%/intents/*}
+    local next_state=${intent#*/intents/}
+    next_state=${next_state%/*}
+    case $2 in
+	failed)
+            [[ $(ci_get_current_states "$prq") = failed ]] && return 0
+            while read state; do
+                states+=("$state")
+            done  < <(ci_get_current_states "$prq")
+            __ci_set_state "$prq" failed \
+                "Intent to transition from $current_state to $next_state failed."
+            for state in "${states[@]}"; do
+                ci_link_state "$prq" "$state" failed
+            done
+            pull_request_comment "$prq" "ci: gating tests for $current_state to $next_state failed.";;
+	passed)
+            __ci_set_state "$prq" "$next_state" \
+		"Intent to transition from $current_state to $next_state passed."
+            ci_link_state "$prq" "$current_state" "$next_state"
+            pull_request_comment "$prq" "CI: Gating tests for $current_state to $next_state passed.";;
+	expire) (cd "$LOCAL_PULL_TRACKING/$prq/ci_state/$current_state/intents/$next_state/"
+		[[ -f .intent ]] || {
+		    touch .intent
+		    git add .intent
+		}
+		git rm -f timeout +([[:xdigit:]])
+		git commit -m "Expired intent to transition $prq from $current_state to $next_state"
+	    );;
+	delete) (cd "$LOCAL_PULL_TRACKING/prq/ci_state"
+		git rm -rf "$current_state/intents/$next_state/"
+		git commit -m "Deleted intent to transition $prq from $current_state to $next_state");;
+	*) die "Second arg to ci_handle_intent should either be passed or failed.";;
+    esac
+}
+
+ci_commit_intent() { ci_handle_intent "$1" "passed"; }
+ci_fail_intent() { ci_handle_intent "$1" "failed"; }
+ci_expire_intent() { ci_handle_intent "$1" "expire"; }
+ci_delete_intent() { ci_handle_intent "$1" "delete"; }
+
+# Show all incomplete intents for a CI ID.
+ci_show_intents() (
+    local id intent
+    local -A intents
+    id=$(pull_request_number_to_id "$1") || \
+        die "$1 is not a valid pull request!"
+    cd "$LOCAL_PULL_TRACKING/$id/ci_state" || die "$id is not in the CI system"
+    while read -r intent; do
+	[[ $intent = */intents/* ]] || continue
+	intent=${intent#./}
+	intent=${intent%/*}
+	from_state=${intent%%/intents/*}
+	to_state=${intent##*/intents/}
+	[[ -d $to_state ]] && continue
+	[[ ${intents["$intent"]} ]] && continue
+	intents["$intent"]="$from_state => $to_state: "
+	if [[ -f $intent/timeout ]] && (( $(date -u +%s) <= $(cat "$intent/timeout") )); then
+	    intents["$intent"]+="active, id=$(cd "$intent"; echo +([[:xdigit:]]))"
+	else
+	    intents["$intent"]+="stale"
+	fi
+    done < <(find -name .intent -or -name timeout)
+    printf "%s\n" "${intents[@]}"
+)
+
+# Handle transitioning a pull request in the CI state machine to closed
+# or merged once it has been closed on Github.
+ci_close_stale_pull_request() (
+    local prq prqs=() p_closed p_merged cout p_state
+    local -A pull
+    # Don't close it until we positively confirm that the pull request is closed.
+    cd "$LOCAL_PULL_TRACKING"
+    case $1 in
+        singletons/*) prqs+=("$LOCAL_PULL_TRACKING/$1");;
+        bundles/*)
+            for prq in "$LOCAL_PULL_TRACKING/$1/"*; do
+                [[ -d $prq && -f $prq/state ]] || continue
+                prqs+=("$prq")
+            done;;
+        *) die "Cannot happen!"
+    esac
+    local p_closed=true
+    local p_merged="merged"
+    for prq in "${prqs[@]}"; do
+        local cout=""
+        . <(source_prq_vars "$prq" local)
+        cout=$(curl_and_res -X GET \
+            "https://api.github.com/repos/$prq_target_account/$prq_local_repo/pulls/$prq_number")
+        (( $? == 0 )) || return
+        local -A pull
+        . <(parse_yml_or_json - pull <<< "$cout")
+        [[ ${pull["state"]} = closed || ${pull["message"]} = 'Not Found' ]] || return
+        [[ ${pull["merged"]} && ${pull["merged"]} = true ]] || p_merged="closed"
+    done
+    debug "Setting state of pull request $1 to $p_merged"
+    __ci_set_state "$1" "$p_merged" "Upstream pull request $p_merged."
+    for p_state in "${states[@]}"; do
+        ci_link_state "$1" "$p_state" "$p_merged"
+    done
+    git add "$1"
+    git commit --allow-empty -qm "Pull request id $1 $p_merged upstream."
+)
+
+ci_close_stale_pull_requests() {
+    local id commit prqs=() prq
+    local -A states
+
+    for prq in "$LOCAL_PULL_TRACKING/bundles/"* "$LOCAL_PULL_TRACKING/singletons/"*/*/*; do
+        id="${prq#$LOCAL_PULL_TRACKING/}"
+        [[ -d $prq/ci_state ]] || continue
+        [[ -d $prq/ci_state/closed || -d $prq/ci_state/merged ]] && continue
+        [[ -d $OPEN_PULL_REQUESTS/$id ]] && continue
+        ci_close_stale_pull_request "$id"
     done
 }
 
+ci_reset_pull_request() {
+    local id
+    id=$(pull_request_number_to_id "$1") || \
+        die "$1 is not a valid pull request!"
+    [[ -d $LOCAL_PULL_TRACKING/$id ]] || \
+        die "$id is not being tracked in the CI system, cannot reset it!"
+    case $(ci_get_current_states "$id") in
+        new) return 0;;
+        closed|merged) die "$id is already closed or merged, cannot be reset!";;
+    esac
+    cp -a "$OPEN_PULL_REQUESTS/$id/." "$LOCAL_PULL_TRACKING/$id/."
+    (   cd "$LOCAL_PULL_TRACKING/$id"
+        git rm -rf ci_state
+        __ci_set_state "$id" "new" "State machine reset due to pull request update."
+        git add .
+        git commit -q -m "State machine for $id reset by $DEV_GITHUB_ID"
+    )
+}
 
+# Test to see if a pull request needs to be reset back to the new
+# state due to the underlying branches changing.
+ci_maybe_reset_pull_request() {
+    # $1 = pull request ID
+    local prqs=() prq tag needs_reset=false
+    case $1 in
+        singletons/*) prqs=("$1");;
+        bundles/*)
+            for prq in "$LOCAL_PULL_TRACKING/$1/"*; do
+                [[ -d $prq && -f $prq/state ]] || continue
+                prqs+=("${prq#$LOCAL_PULL_TRACKING/}")
+            done;;
+    esac
+    for prq in "${prqs[@]}"; do
+        for tag in source_sha target_sha; do
+            # If only some of them are here, this pull request is probably
+            # in a partially-closed state.  Ignore it until we think of something
+            # better to do.
+            [[ -f $OPEN_PULL_REQUESTS/$prq/$tag && \
+                -f $LOCAL_PULL_TRACKING/$prq/$tag ]] || continue
+            [[ $(cat "$OPEN_PULL_REQUESTS/$prq/$tag") = \
+                $(cat "$LOCAL_PULL_TRACKING/$prq/$tag") ]] && continue
+            needs_reset=true
+            break 2
+        done
+    done
+    [[ $needs_reset = false ]] && return 0
+    ci_reset_pull_request "$1"
+}
+
+# Handle cleaning up old state transitions, resetting any pulls that need
+# resetting and importing any pull requests we are not tracking.
 ci_import_new_pull_requests() {
     local nr id
     [[ -f $OPEN_PULL_REQUESTS/pull_request_index ]] || return 0
+    ci_close_stale_pull_requests
     while read nr id; do
-        [[ -d $LOCAL_PULL_TRACKING/$id ]] && continue
+        if [[ -d $LOCAL_PULL_TRACKING/$id ]]; then
+            ci_maybe_reset_pull_request "$id"
+            continue
+        fi
         mkdir -p "$LOCAL_PULL_TRACKING/$id"
         cp -a "$OPEN_PULL_REQUESTS/$id/." "$LOCAL_PULL_TRACKING/$id/."
-        __ci_set_status "$id" "new"
+        __ci_set_state "$id" "new"
+        debug "Adding new pull request $id"
         (   cd "$LOCAL_PULL_TRACKING/$id"
             git add .
-            git commit -m "Added new pull request $id")
+            git commit -qm "Added new pull request $id")
     done < "$OPEN_PULL_REQUESTS/pull_request_index"
 }
 
 __fetch_all() {
-    local remote remotes=() res=true 
+    local remote remotes=() res=true
     if [[ $@ || $DEV_FROM_REMOTES ]]; then
 	[[ $1 ]] && remotes+=("$@")
 	[[ $DEV_FROM_REMOTES ]] && remotes+=("${DEV_FROM_REMOTES[@]}")
@@ -1540,8 +2067,8 @@ __fetch_all() {
             printf '!'
             res=false
         fi
-	[[ $remote = personal ]] && scrub_merged_pulls || :
     done
+    scrub_merged_pull_requests
     [[ $res = true ]] && debug "  All fetches passed." 2>> "$results_dir/$logfile"
 }
 
@@ -1553,8 +2080,8 @@ fetch_all() {
     dt=$(date +%s)
     results_dir="$(mktemp -d /tmp/crowbar_fetch_${USER}_${dt}_XXXXXX)" || \
         die "Cannot create temporary storage for fetch results!"
-    debug "Fetching updates:"
     fetch_ci_tracking
+    debug "Fetching updates:"
     for d in "$CROWBAR_DIR/barclamps/"* "$CROWBAR_DIR"; do
         [[ -d $d/.git ]] || continue
         if [[ $BADLINK ]]; then
@@ -1583,6 +2110,9 @@ fetch_all() {
     update_all_tracking_branches
     show_open_pull_requests
     sort_pull_requests
+    if [[ -d $LOCAL_PULL_TRACKING/.git ]]; then
+        ci_import_new_pull_requests
+    fi
 }
 
 # Attempt to scrub merged pull requests across all of the barclamps.
@@ -1602,9 +2132,9 @@ curl_and_res() {
 	0) printf '%s' "$__r";;
 	7) echo "Unable to contact Github, please try again later." >&2
 	    return 1;;
-	22) return 1;;
+	22) return 2;;
 	*) echo "Curl reported error ${?}!." >&2
-	    return 1;;
+	    return 3;;
     esac
 }
 
@@ -1691,7 +2221,8 @@ __sync_remotes() {
 	remote_repo=$(git_url_for_remote "$remote") && \
             $1 ${remote_repo%.git} && continue
         remote_repo="$($2 "$urlbase")" || continue
-	debug "Synchronizing remote $remote for barclamp $1"
+        remote_repo="${remote_repo#$urlbase/}"
+	debug "Synchronizing remote $remote for $PWD"
 	if git_remote_exists "$remote"; then
 	    set_url_remote "$remote" "$urlbase" "$remote_repo" || continue
 	else
@@ -2436,8 +2967,10 @@ dev_help () {
 
 # Tests to see if the given branch in a repo needs a pull request.
 branch_needs_pull_req() {
-    # $1 = branch
-    local upstream="$to_remote/$1"
+    # $1 = local branch
+    # $2 = (optional) target branch
+    local target="${2:-$1}"
+    local upstream="$to_remote/$target"
     git rev-parse --verify -q "$upstream" &>/dev/null || return 1
     branches_synced '.' "refs/remotes/$upstream" \
 	"refs/heads/$1" && return 1
@@ -2507,9 +3040,16 @@ pull_requests_prep() {
     remote_is_github "$to_remote" || \
 	die "Cannot issue pull requests for $to_remote, it is not from github."
     local branch bc build release=$(current_release)
+    local target_release="$release"
+    if [[ $1 = --merge ]]; then
+        target_release="$(find_best_parent "$release")" || \
+            die "No parent release to merge into!"
+        echo "Will generate pull requests for merge $release into $target_release" >&2
+    fi
     for bc in $(barclamps_in_release $release); do
         for branch in $(barclamp_branches_for_release "$release" "$bc"); do
-	    in_barclamp "$bc" branch_needs_pull_req "$branch" || continue
+            local target_branch=$(barclamp_branches_for_release "$target_release" "$bc")
+	    in_barclamp "$bc" branch_needs_pull_req "$branch" "$target_branch" || continue
 	    barclamps_to_push+=("$bc")
             break
         done
@@ -2522,6 +3062,8 @@ pull_requests_prep() {
     [[ ${push_master} ]] && echo "Crowbar needs push"
     echo "Command to generate pull requests:"
     echo -n "$0 pull-requests-gen --to $to_remote --release $release"
+    [[ $target_release != $release ]] && \
+        echo -n " --merge"
     [[ ${push_master} ]] && \
 	echo -n " --branches master"
     [[ ${barclamps_to_push[*]} ]] && \
@@ -2592,7 +3134,8 @@ pull_requests_gen() {
     remote_available personal && remote_is_github personal || \
 	die "No personal remote available at Github.  Cannot do pull requests."
     local -A barclamps branches barclamp_branches bc_pulls br_pulls refs
-    local bc br bcr bcb title body option bc_name head release
+    local bc br bcr bcb title body option bc_name head release target_release
+    local merge_into_parent=false
     local prc=0 n=1
     local to_remote="$(origin_remote)"
     [[ $DEV_TO_REMOTES ]] && to_remote="$DEV_TO_REMOTES"
@@ -2629,11 +3172,17 @@ pull_requests_gen() {
                 release_exists "$1" || die "$1 is not a release"
                 release="$1"
                 shift;;
+            --merge) shift; merge_into_parent=true;;
 	    *) die "Unknown option $1 to $0 pull-requests-gen!";;
 	esac
     done
 
     [[ $release ]] || release=$(current_release)
+    target_release=$release
+    if [[ $merge_into_parent = true ]]; then
+        target_release=$(find_best_parent "$release") || \
+            die "No parent release to merge into!"
+    fi
 
     switch_release "$release"
     # OK, sanity-check any barclamp branches we were passed.
@@ -2694,6 +3243,7 @@ pull_requests_gen() {
 	local bc=${barclamp%%/*}
 	local bc_base=${barclamp#*/}
 	in_barclamp "$bc" git_push personal "$bc_base:${bc_pulls[$barclamp]}"
+        local bc_target="$(barclamp_branches_for_release "$target_release" "$bc")"
 	local bc_head="$DEV_GITHUB_ID:${bc_pulls[$barclamp]}"
 	local bc_name=$(in_barclamp $bc git_url_for_remote $to_remote)
 	bc_name=${bc_name##*/}
@@ -2701,9 +3251,9 @@ pull_requests_gen() {
 	bc_name=${bc_name%.git}
 	do_pull_request \
 	    "https://api.github.com/repos/$to_account/$bc_name/pulls" \
-	    --title "$title [$n/$prc]" --base "$bc_base" --head "$bc_head" \
+	    --title "$title [$n/$prc]" --base "$bc_target" --head "$bc_head" \
 	    --body "@$body" \
-	    --body "$(in_barclamp "$bc" diffstat_from_upstream "$bc_base")" \
+	    --body "$(in_barclamp "$bc" diffstat_from_upstream "$bc_target")" \
             --body "Crowbar-Pull-ID: $pull_id" \
             --body "Crowbar-Release: $release"
 	n=$(($n + 1))
@@ -3304,7 +3854,7 @@ reinstall_barclamps() {
         barclamp_list+=("$CROWBAR_DIR/barclamps/$bc")
     done
     debug "${barclamps[*]} barclamps have changed, reloading."
-    (   cd releases/$build/extra
+    (   cd ${CROWBAR_DIR}/releases/$build/extra
         ./barclamp_install.rb --force --no-files --no-chef -b \
             "$CROWBAR_TEST_DIR" "${barclamp_list[@]}") || \
             die "Failed to install some barclamps."
@@ -3353,6 +3903,8 @@ setup_unit_tests() (
     fi
     rm -rf "$CROWBAR_TEST_DIR"
     mkdir "$CROWBAR_TEST_DIR"
+    mkdir -p "$CROWBAR_TEST_DIR/doc/framework"
+    cp -r doc/* "$CROWBAR_TEST_DIR/doc/framework"
     reinstall_barclamps "${barclamps[@]}" || exit 1
     cd "$CROWBAR_TEST_DIR"
     mv crowbar_framework/Gemfile* .
@@ -3394,8 +3946,8 @@ setup_unit_tests() (
         "install Crowbar, so results may differ."
     fi
 
-    cd "$CROWBAR_TEST_DIR/crowbar_framework/BDD"
-    sudo "$CROWBAR_TEST_DIR/crowbar_framework/BDD/linux_install.sh"
+    cd "$CROWBAR_TEST_DIR/BDD"
+    sudo "$CROWBAR_TEST_DIR/BDD/linux_install.sh"
     ./linux_compile.sh
     current_build >"$CROWBAR_TEST_DIR/.build"
 )
@@ -3421,9 +3973,8 @@ reload_unit_tests() (
           done
       done
   fi
-  cd "$CROWBAR_TEST_DIR/crowbar_framework/BDD"
+  cd "$CROWBAR_TEST_DIR/BDD"
   ./linux_compile.sh
-  sed -ie 's/192.168.124.10/127.0.0.1/' "crowbar.config"
 )
 
 run_unit_tests() (
@@ -3446,7 +3997,7 @@ run_unit_tests() (
     # Start rails
     bundle exec script/rails s Puma >> log/test.out 2>> log/test.err &
     sleep 10
-    (cd BDD; erl -s bdd test crowbar -s init stop -noshell) || final_result=fail
+    (cd "$CROWBAR_TEST_DIR/BDD"; erl -s bdd test devtool -s init stop -noshell) || final_result=fail
     kill $(ps -ef | grep Puma | grep ruby | awk '{ print $2 }')
 
     # Run chef unit tests
@@ -3620,10 +4171,30 @@ ci_helper() {
     case $req in
         fetch) fetch_ci_tracking "$@";;
         import) ci_import_new_pull_requests "$@";;
-        push) (cd "$LOCAL_PULL_TRACKING"; git push);;
-        state-dirs) ci_get_current_state_paths "$@";;
+        push) push_ci_tracking "$@";;
+        reset)
+            ci_do_and_push ci_reset_pull_request "$@";;
+        states) ci_get_current_states "$@";;
+        all-next-states) ci_all_next_states "$@";;
         next-states) ci_next_states "$@";;
-        *) die "Not a valid CI command.  Try fetch, import, or push.";;
+        open-ids) ci_open_ids "$@";;
+        failed-ids) ci_filtered_ids failed needs-work;;
+        filtered-ids) ci_filtered_ids "$@";;
+        all-open-ids) ci_ids "$@";;
+        register-intent)
+            ci_do_and_push ci_register_intent "$@";;
+        commit-intent)
+            ci_do_and_push ci_commit_intent "$@";;
+	expire-intent)
+            ci_do_and_push ci_expire_intent "$@";;
+	delete-intent)
+	    ci_do_and_push ci_delete_intent "$@";;
+	show-intents) ci_show_intents "$@";;
+        fail-intent)
+            ci_do_and_push ci_fail_intent "$@";;
+        kill-stale-intents)
+	    ci_do_and_push ci_kill_stale_intents "$@";;
+        *) die "Not a valid CI command.  Run $0 help ci for valid CI commands.";;
     esac
 }
 # Hash for handling command -> function mapping.
@@ -3997,11 +4568,11 @@ DEV_LONG_HELP["push-tag"]="Pushes a tagged release to specified remotes.
   must be passed explicitly with --to."
 DEV_LONG_HELP["fetch-pull-requests"]="Fetch pull request metadata from a remote"
 DEV_LONG_HELP["pull-requests"]="Manage pull requests.
-  By default, dev fetch will also grab pull request information, and display
-  the number of open pull requests and pull request bundles after all other fetch
-  operations have finished.
   Subcommands:
     fetch: Fetch open pull requests from all repositories at a specific remote.
+      By default, dev fetch will also grab pull request information, and
+      display the number of open pull requests and pull request bundles
+      after all other fetch operations have finished.
     prep: Prepare to issue pull requests.
       Fetches, Syncs, and backs up all changes, figures out the set of
       barclamps and crowbar branches in the current release that have
@@ -4009,13 +4580,20 @@ DEV_LONG_HELP["pull-requests"]="Manage pull requests.
       that you want to issue pull requests for all the changes it found.
 
       pull-requests-prep honors the --to flag to control what remote you
-      want to send your pull requests to.
+      want to send your pull requests to.  It also honors a --merge flag
+      to signal that you want to merge the current release into its parent.
+      This lets you use feature branches as topic branches.
 
       The output is a command line that can be edited to reflect what you
       actually want to issue pull requests for.
     gen: Generate pull requests to Github.
       Creates a set of pull requests based on differences inthe current
       release between your origin remote and your local trees.
+
+      If you pass the --merge flag to pull-requests gen, it will generate
+      pull requests that will merge the current release into its parent
+      release.  This is intended to facilitate using feature bundles as
+      short-lived topic branches.
     list: List the open pull requests an pull request bundles.
       List displays the pull requests in oldest-first format, and the
       numbers next to each pull request will be stable until the next
@@ -4027,16 +4605,76 @@ DEV_LONG_HELP["pull-requests"]="Manage pull requests.
     close: Close a pull request or pull request bundle
       Second arg must be a closing comment.
     builds: Show a list of builds this pull request should trigger.
-    checkout: Check out the exact contents of a pull request.  
+    checkout: Check out the exact contents of a pull request.
     switch: Switch to a new tree that has the contents of a pull request
-      merged into your current trees.  Your trees must be clean before 
+      merged into your current trees.  Your trees must be clean before
       doing this. The first argument to this command must be a pull request
       number, and the second argument must be a build that is applicable to
       the pull request.
 
       Please note that this will put any trees that have changes to be pulled
       into a detached HEAD state.  You can use dev switch to get back to normal."
-DEV_LONG_HELP["ci"]="Helper."
+DEV_LONG_HELP["ci"]="Crowbar Continuous Intergration Helper.
+  Any of the CI subcommands that take an ID can either take a raw ID as
+  returned by dev ci all-ids,
+  or a pull request number as returned by dev pull-requests list, although the
+  latter will only work for pull request bundles that are imported and not closed.
+  Subcommands:
+    fetch: Pull the latest CI tracking metadata from the upstream repository.
+      This will attempt to rebase any local state changes on top of changes
+      from upstream.  If that fails, it will throw away your local changes and
+      exit with a non-zero exit status.
+    push: Performs a fetch, tests to see if there is any local state that
+      is not in the just-pulled state, and tries to push the local state
+      upstream if there is any local state.
+    import: Imports the current state of tracked pull requests from their
+      Github pull requests, closing and merging pulls in the CI state database
+      as needed. It will then reset any pull requests whose underlying Git
+      branches have been updated, and import any pull requests that are not
+      already being tracked by the CI database.
+    reset: Resets the state machine for a specific pull request ID back to new.
+    open-ids: Lists the IDs of all open pull requests and pull request bundles.
+      These ids are stable and globally unique.
+    failed-ids: Lists the IDs of all the failed pull requests.
+    filtered-ids: Lists the IDs of all pull requests in a given state.
+    all-open-ids: List the IDs of all the pull requests and pull request bundles
+      that the CI system knows about.
+    states: Shows the current states that a pull request or pull request bundle
+      is at in the CI system.
+      The only argument is the ID of the pull request.
+    all-next-states: Shows all the next states that may be applicable to
+      the current or passed state of a pull request.
+      Arguments:
+        id: The ID of the pull request.
+        (optional) state: The state to determine the next state from. Defaults
+          to the current state of the pull request, if the pull request is
+          only in one state.
+    next-states: Same as all-next-states, but filters out state transitions
+      that have an intent registered for them in the state machine.
+    register-intent: Register an intent to do whatever work is needed to
+      run the tests and do the work needed to transition a pull request
+      from one state to another.
+      Arguments:
+        id: A pull request ID.
+        current_state: One of the current states of the pull request.
+        next_state: The intended next state.  This must be one of the states
+          that next-states would return for current_state.
+        timeout: How many seconds from now the CI system can discard this
+          intent.  Defaults to 5 hours, but it should be set to a smaller value
+          if you expect your task to take a shorter amount than this.
+      Returns a unique ID for the intent.
+    commit-intent: Tell the CI system that the test we wanted to run for a
+      registered intent passed, and that it should transition appropriatly.
+      Arguments:
+        id: An intent ID returned by register-intent.
+    fail-intent: The same as commit-intent, but it will transition to the
+      failed state instead.
+    expire-intent: Immediatly force an intent to go stale.
+    delete-intent: Deletes an intent.  This potentially prunes a path from
+      the state transition tree.
+    show-intents: Shows all the current and stale intents for a pull request. 
+    kill-stale-intents: Given a pull request ID, this will kill any stale intents
+      that are hanging around and attempt to push them out."
 
 # Verify that we have help for all commands, and exit if we don't.
 for cmd in "${!DEV_COMMANDS[@]}"; do

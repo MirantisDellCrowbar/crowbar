@@ -260,7 +260,8 @@ while [[ $1 ]]; do
 	--no-metadata-update) shift; ALLOW_CACHE_METADATA_UPDATE=false;;
         --wild-cache) shift; ALLOW_CACHE_UPDATE=true; ALLOW_CACHE_METADATA_UPDATE=true;
             WILD_CACHE=true
-            export CACHE_DIR="$(mktemp -d "${CACHE_DIR%/*}/.crowbar_temp_cache-XXXXXX")";;
+            export CACHE_DIR="$(mktemp -d "${CACHE_DIR%/*}/.crowbar_temp_cache-XXXXXX")"
+            export SLEDGEHAMMER_PXE_DIR="$CACHE_DIR/tftpboot";;
 	# Go through all the motions, but do not actaully generate
 	# an ISO at the end.  This is useful for generating barclamp
 	# tarballs.
@@ -368,7 +369,7 @@ do_crowbar_build() {
     fi
 
     # Make additional directories we will need.
-    for d in discovery extra/pkgs extra/files; do
+    for d in discovery extra/pkgs extra/files doc/framework; do
 	mkdir -p "$BUILD_DIR/$d"
     done
 
@@ -386,6 +387,7 @@ do_crowbar_build() {
     d="$(build_cfg_dir)" && [[ -d $d/extra && -d $d/change-image ]] || \
         die "Cannot find extra and change-image directories for $(current_build)!"
     cp -r "$d/extra"/* "$BUILD_DIR/extra"
+    cp -r "$CROWBAR_DIR/doc"/* "$BUILD_DIR/doc/framework"
     cp -r "$d/change-image/"* "$BUILD_DIR"
     for d in "$OS-common" "$OS_TOKEN-extra"; do
 	[[ -d $CROWBAR_DIR/$d ]] || continue
