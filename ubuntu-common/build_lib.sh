@@ -146,6 +146,8 @@ add_offline_repos() {
         add_repos "deb file:///packages/barclamps/$bc /"
     done
     sudo mount --bind "$IMAGE_DIR" "$CHROOT/packages/base"
+    add_repos "deb http://archive.ubuntu.com/ubuntu $OS_CODENAME main restricted universe"
+    add_repos "deb http://extras.ubuntu.com/ubuntu $OS_CODENAME main"
     add_repos "deb file:///packages/base $OS_CODENAME main restricted"
 }
 
@@ -155,7 +157,7 @@ __make_chroot() {
     # Ubuntu to ensure that we don't interfere with the host's package cache.
     local d repo bc f
     sudo debootstrap "$OS_CODENAME" "$CHROOT" \
-        "file://$IMAGE_DIR" || \
+        http://archive.ubuntu.com/ubuntu/ || \
         die 1 "Could not bootstrap our scratch target!"
     # mount some important directories for the chroot
 
