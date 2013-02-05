@@ -9,6 +9,7 @@ OS_VERSION=12.10
 OS_TOKEN="$OS-$OS_VERSION"
 OS_CODENAME=quantal
 ISO=ubuntu-12.10-server-amd64.iso
+REMOTE_SOURCE="http://archive.ubuntu.com/ubuntu/"
 # uncomment to use the daily beta build, if you have it...
 #ISO=precise-server-amd64.iso
 
