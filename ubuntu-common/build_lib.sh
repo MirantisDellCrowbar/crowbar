@@ -154,7 +154,7 @@ __make_chroot() {
     # debootstrap a minimal install of our target version of
     # Ubuntu to ensure that we don't interfere with the host's package cache.
     local d repo bc f
-    if [ -z "${REMOTE_SOURCE}" ];
+    if [ -z "${REMOTE_SOURCE}" ]; then
         sudo debootstrap "$OS_CODENAME" "$CHROOT" "file://$IMAGE_DIR" || die 1 "Could not bootstrap our scratch target!"
     else
         sudo debootstrap "$OS_CODENAME" "$CHROOT" http://archive.ubuntu.com/ubuntu/ || die 1 "Could not bootstrap our scratch target!"
