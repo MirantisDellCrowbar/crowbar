@@ -3,9 +3,8 @@
 REDHAT_REPOS=("rpm http://rbel.frameos.org/rbel6" 
     "rpm http://mirrors.servercentral.net/fedora/epel/6/i386/epel-release-6-7.noarch.rpm"
     "bare nginx http://nginx.org/packages/rhel/6/x86_64/")
-UBUNTU_REPOS=("http://apt.opscode.com precise-0.10 main"
-    "http://ppa.launchpad.net/nginx/stable/ubuntu precise main")
-
+UBUNTU_REPOS=("http://apt.opscode.com $OS_CODENAME-0.10 main"
+    "http://ppa.launchpad.net/nginx/stable/ubuntu $OS_CODENAME main")
 mkdir -p /opt/dell
 
 [[ -f /opt/dell/.prereq_installed ]] && exit 0
