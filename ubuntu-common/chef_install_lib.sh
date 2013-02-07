@@ -42,7 +42,7 @@ bring_up_chef() {
     log_to apt apt-get -y install chef kwalify
     service chef-client stop
     killall chef-client
-    if [[ $OS_CODENAME == quantal ]]; then
+    if [[ $OS_TOKEN == ubuntu-12.10 ]]; then
       log_to apt apt-get -y install chef-server-api chef-server-webui
     else
       log_to apt apt-get -y install chef-server chef-server-webui
