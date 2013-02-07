@@ -46,6 +46,7 @@ bring_up_chef() {
       log_to apt apt-get -y install chef-server-api chef-server-webui
     else
       log_to apt apt-get -y install chef-server chef-server-webui
+    fi
     (cd "$DVD_PATH/extra/patches"; chmod +x ./patch.sh ; ./patch.sh) || exit 1
     # increase chef-solr index field size
     perl -i -ne 'if ($_ =~ /<maxFieldLength>(.*)<\/maxFieldLength>/){ print "<maxFieldLength>200000</maxFieldLength> \n" } else { print } '  /var/lib/chef/solr/conf/solrconfig.xml
