@@ -9,6 +9,12 @@ BASEDIR="/tftpboot/ubuntu_dvd"
 . /etc/lsb-release
 OS_TOKEN="ubuntu-${DISTRIB_RELEASE}"
 
+if [[ $OS_TOKEN == ubuntu-12.10 ]]; then
+###quantal comes with ruby1.9.1 by default
+    update-alternatives --set gem /usr/bin/gem1.8
+    update-alternatives --set ruby /usr/bin/ruby1.8
+fi
+
 update_hostname() { update_hostname.sh $FQDN; }
 
 install_base_packages() {
