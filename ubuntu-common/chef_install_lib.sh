@@ -44,6 +44,7 @@ bring_up_chef() {
     killall chef-client
     if [[ $OS_TOKEN == ubuntu-12.10 ]]; then
       log_to apt apt-get -y install chef-server-api chef-server-webui
+      grep -q '/usr/share/java/\*\*' /var/lib/chef/solr/solr-jetty/etc/start.config || echo '/usr/share/java/**' >> /var/lib/chef/solr/solr-jetty/etc/start.config
     else
       log_to apt apt-get -y install chef-server chef-server-webui
     fi
