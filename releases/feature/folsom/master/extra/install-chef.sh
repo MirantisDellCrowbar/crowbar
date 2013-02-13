@@ -274,7 +274,7 @@ fi
 # Bundle up our patches and put them in a sane place
 (cd "$DVD_PATH/extra"; tar czf "/tftpboot/patches.tar.gz" patches)
 
-if [[ $OS_TOKEN = ubuntu-12.04 ]]; then
+if [[ $OS_TOKEN = ubuntu-12.04 ]] || [[ $OS_TOKEN = ubuntu-12.10 ]]; then
     # HACKHACKHACKHACK
     # Let me begin with that this is really crappy.  Ubuntu gem management is confusing
     # at best or busted at worst.
