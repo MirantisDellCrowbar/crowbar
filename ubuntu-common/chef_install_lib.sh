@@ -13,6 +13,7 @@ if [[ $OS_TOKEN == ubuntu-12.10 ]]; then
 ###quantal comes with ruby1.9.1 by default
     update-alternatives --set gem /usr/bin/gem1.8
     update-alternatives --set ruby /usr/bin/ruby1.8
+    apt-get --force-yes -y remove ruby1.9.1
 fi
 
 update_hostname() { update_hostname.sh $FQDN; }
