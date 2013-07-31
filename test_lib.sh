@@ -6,6 +6,8 @@
 # We only need to be sourced once.
 [[ $SMOKETEST_LIB_SOURCED = true ]] && exit 0
 
+[[ $ADMIN_MEM ]] || ADMIN_MEM=4G
+
 # Make sure we know where to find our test binaries
 [[ -d $CROWBAR_DIR/testing/cli ]] || mkdir -p "$CROWBAR_DIR/testing/cli"
 export PATH="$CROWBAR_DIR/testing/cli:$CROWBAR_DIR/test_framework:$CROWBAR_DIR:$CROWBAR_DIR/change-image/dell:$PATH:/sbin:/usr/sbin"
@@ -15,7 +17,7 @@ SMOKETEST_RESULTS=()
 # Commands we have to run under sudo -n
 SUDO_CMDS="brctl ip umount mount make_cgroups.sh"
 # Commands we need to run as $USER
-NEEDED_CMDS="ruby gem kvm screen qemu-img sudo"
+NEEDED_CMDS="ruby gem screen qemu-img sudo"
 # Gems we have to have installed.
 NEEDED_GEMS="json net-http-digest_auth"
 declare -a SMOKETEST_VLANS
@@ -23,6 +25,20 @@ SMOKETEST_VLANS[200]="192.168.125.1/24"
 SMOKETEST_VLANS[300]="192.168.126.1/24"
 SMOKETEST_VLANS[500]="192.168.127.1/24"
 SMOKETEST_VLANS[600]="192.168.128.1/24"
+
+ADMIN_HOSTNAMES=("cr0wbar.pwns.joo"
+    "vltima.ratio.regvm"
+    "altanoma.nihil.non"
+    "admin.smoke.test"
+    "bork.bork.bork")
+
+ADMIN_HOSTNAME=${ADMIN_HOSTNAMES[$(($RANDOM % ${#ADMIN_HOSTNAMES[@]}))]}
+debug "Picked $ADMIN_HOSTNAME"
+export SMOKETEST_DOMAIN=${ADMIN_HOSTNAME#*.}
+
+for KVM in kvm qemu-kvm qemu-system-x86_64 ''; do
+    type $KVM &>/dev/null && break
+done
 
 # THis lock is held whenever we are running tests.  It exists to
 # prevent multiple instances of the smoketest from running at once.
@@ -62,7 +78,7 @@ export CROWBAR_KEY="crowbar:crowbar"
 # Please keep it at 4 characters or less.
 SMOKETEST_BRIDGES=(crowbar-pub)
 
-NICS_PER_BRIDGE=2
+NICS_PER_BRIDGE=3
 
 # An array of physical interfaces and the bridges they should be bound to.
 # We need to use real physical interfaces becasue Crowbar assumes
@@ -202,19 +218,28 @@ smoketest_cleanup() {
     # We ignore errors in this function.
     set +e
     flock 75
-    [[ -d $smoketest_dir ]] || return 0
 
     killall check_ready
     [[ $develop_mode = true ]] && pause
     # Gather final logs if our admin node is up.
     smoketest_get_cluster_logs final
     # Make sure our virtual machines have been torn down.
-    for pidfile in "$smoketest_dir/"*.pid; do
-        local vmname=${pidfile##*/}
-        vmname=${vmname%.pid}
-        [[ $vmname = '*' ]] && continue
-        kill_vm "$vmname" || :
-    done
+    if [[ -d $smoketest_dir ]]; then
+        for pidfile in "$smoketest_dir/"*.pid; do
+            local vmname=${pidfile##*/}
+            vmname=${vmname%.pid}
+            [[ $vmname = '*' ]] && continue
+            kill_vm "$vmname" || :
+        done
+        target="${smoketest_dir##*/}-$(date '+%Y%m%d-%H%M%S')-${final_status}"
+        rm -f "$smoketest_dir/"*.disk || :
+        cp "$CROWBAR_DIR/smoketest.log" "$smoketest_dir"
+        (cd "$smoketest_dir/.."; \
+            tar czf "$currdir/$target.tar.gz" "${smoketest_dir##*/}")
+        echo "Logs are available at $currdir/$target.tar.gz."
+        rm -rf "$smoketest_dir"
+    fi
+
     # If there are any commands to run at smoketest_cleanup, run them now.
     for c in "${smoketest_cleanup_cmds[@]}"; do
         eval $c || :
@@ -241,13 +266,6 @@ smoketest_cleanup() {
     }
     [[ $final_status ]] || final_status=Passed
     echo "Deploy $final_status."
-    target="${smoketest_dir##*/}-$(date '+%Y%m%d-%H%M%S')-${final_status}"
-    rm -f "$smoketest_dir/"*.disk || :
-    cp "$CROWBAR_DIR/smoketest.log" "$smoketest_dir"
-    (cd "$smoketest_dir/.."; \
-        tar czf "$currdir/$target.tar.gz" "${smoketest_dir##*/}")
-    echo "Logs are available at $currdir/$target.tar.gz."
-    rm -rf "$smoketest_dir"
     [[ $final_status = Passed ]]
 } 75>"$CROWBAR_DIR/.smoketest_cleanup.lock"
 
@@ -326,7 +344,7 @@ makenics() {
             local nic_name="$1-${idx}-${bridge##*-}"
             getmac
             if [[ $nic_name =~ virt-.-0-pub ]]; then
-                SMOKETEST_SLAVES["$1"]="d${MACADDR//:/-}.smoke.test"
+                SMOKETEST_SLAVES["$1"]="d${MACADDR//:/-}.${SMOKETEST_DOMAIN}"
             fi
             vm_nics+=("$MACADDR,$nic_name")
         done
@@ -409,7 +427,7 @@ wait_for_kvm() {
     shift
     local pidfile="$smoketest_dir/$vmname.pid"
     [[ -f $pidfile ]] || {
-        smoektest_update_status "$vmanme" "No pid file for KVM."
+        smoketest_update_status "$vmanme" "No pid file for KVM."
         return 1 # no pidfile? Bad Things happened.
     }
     local kvmpid=$(cat "$pidfile")
@@ -535,19 +553,20 @@ run_kvm() {
     local cpu_count=2 mem_size=2G
     if [[ $vmname = admin ]] ; then
       cpu_count=4
-      mem_size=4G
+      # set admin node memory in .build_crowbar.conf file as ADMIN_MEM=xG
+      mem_size=$ADMIN_MEM
     fi
     # Hack to pick the fastest disk caching mode.
     # We use unsafe caching if we can on the vms because we will just
     # rebuild the filesystems from scratch if anything goes wrong.
     if ! [[ $drive_cache ]]; then
-        if kvm --help |grep -q 'cache.*unsafe'; then
+        if "$KVM" --help |grep -q 'cache.*unsafe'; then
             drive_cache=unsafe
         else
             drive_cache=writeback
         fi
-        if kvm -device \? 2>&1 |grep -q ahci && \
-            [[ $(kvm -version) =~ kvm-1 ]]; then
+        if "$KVM" -device \? 2>&1 |grep -q ahci && \
+            [[ $("$KVM" -version) =~ kvm-1 ]]; then
             kvm_use_ahci=true
         fi
     fi
@@ -621,12 +640,14 @@ run_kvm() {
         # If we are running under X, then use a graphical display.
         if [[ $DISPLAY ]]; then
             kvmargs+=( -sdl -daemonize )
-            kvm "${kvmargs[@]}" "$@"
+            "$KVM" "${kvmargs[@]}" "$@"
         else
             # otherwise, launch ourselves under screen.
-            kvmargs+=( -curses )
+            # get port from name. For virt-123 should be 123
+            vncport="$(echo $vmname | sed 's|.*\([0-9]\+\)|\1|g')"
+            kvmargs+=( -vnc :$vncport )
             screen -S "$SMOKETEST_SCREEN" -X screen \
-                -t "$vm_gen" kvm "${kvmargs[@]}" "$@"
+                -t "$vm_gen" "$KVM" "${kvmargs[@]}" "$@"
             screen -S "$SMOKETEST_SCREEN" -p "$vm_gen" -X log on
         fi
         # wait up to 10 seconds for a PID file
@@ -706,7 +727,7 @@ run_admin_node() {
         [[ $DISPLAY ]] || kernel_params+=" console=ttyS1,115200n81"
         [[ -r $HOME/.ssh/id_rsa.pub ]] && kernel_params+=" crowbar.authkey=$(sed 's/ /\\040/g' <"$HOME/.ssh/id_rsa.pub")"
         if ! [[ $manual_deploy = true ]]; then
-            kernel_params+=" crowbar.hostname=admin.smoke.test"
+            kernel_params+=" crowbar.hostname=$ADMIN_HOSTNAME"
         fi
         if [[ $develop_mode ]]; then
             kernel_params+=" crowbar.debug"
@@ -757,8 +778,10 @@ run_admin_node() {
     ssh root@192.168.124.10 mkdir -p /opt/dell/.hooks/admin-post-install.d
     scp -r "$CROWBAR_DIR/test_framework/admin-post-hooks/." \
         "root@192.168.124.10:/opt/dell/.hooks/admin-post-install.d/"
-    # Kick off the install.
-    ssh root@192.168.124.10 /opt/dell/bin/install-crowbar admin.smoke.test
+    # If we want to manually deploy, then exit now.
+    [[ $manual_deploy ]] && return 0
+    # Otherwise, kick off the install.
+    ssh root@192.168.124.10 /opt/dell/bin/install-crowbar $ADMIN_HOSTNAME
     sleep 5
     # Wait for the screen session to terminate
     printf "Waiting for crowbar to install: "
@@ -904,7 +927,7 @@ create_slaves() {
     local mac
     for mac in "${PHYSICAL_MACS[@]}"; do
         nodename="physical-$((i++))"
-        SMOKETEST_SLAVES["$nodename"]="d${mac//:/-}.smoke.test"
+        SMOKETEST_SLAVES["$nodename"]="d${mac//:/-}.${SMOKETEST_DOMAIN}"
         > "$smoketest_dir/$nodename.status"
     done
 }
@@ -1080,6 +1103,7 @@ EOF
 run_test() {
     # If something already holds the testing lock, it is not safe to continue.
     flock -n -x 100 || die "Could not grab $SMOKETEST_LOCK in run_test"
+    [[ $KVM ]] || die "Cannot find kvm!  Are you sure it is installed?"
     for cmd in $NEEDED_CMDS $SUDO_CMDS; do
         which $cmd &>/dev/null && continue
         echo "Missing required command $cmd (or it is not in \$PATH)."
@@ -1131,7 +1155,9 @@ run_test() {
             pause-after-admin) local pause_after_admin=true;;
             admin-only) local admin_only=true;;
             develop-mode) local develop_mode=true;;
-            manual-deploy) local manual_deploy=true;;
+            manual-deploy) local manual_deploy=true
+                local develop_mode=true
+                local admin_only=true;;
             use-iso) shift; SMOKETEST_ISO="$1";;
             single*|dual*|team*) local network_mode="$1";;
             bind-nic) shift;

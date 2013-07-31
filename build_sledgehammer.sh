@@ -143,4 +143,8 @@ in_chroot /mnt/make_sledgehammer
 cp -a "$CHROOT/mnt/tftpboot" "$CACHE_DIR/"
 in_chroot /bin/rm -rf /mnt/tftpboot
 
+while read line; do
+    sudo losetup -d "${line%%:*}"
+done < <(sudo losetup -a |grep sledgehammer.iso)
+
 [[ -f $CACHE_DIR/tftpboot/initrd0.img ]]

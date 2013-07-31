@@ -128,6 +128,17 @@ add_offline_repos() (
     done
 )
 
+# For Fedora 17 and later packages are stored in subdirectories bucketed by
+# the first letter of the package name and lower cased
+__pkg_location() {
+    if [ "$OS" = "fedora" -a $OS_VERSION = 18 ]; then
+	lowercase_pkg=${pkg,,}
+        echo "$(find_cd_pool)/${lowercase_pkg:0:1}/$pkg"
+    else
+	echo "$(find_cd_pool)/$pkg"
+    fi
+}
+
 # This function makes a functional centos chroot environment.
 # We do this so that we can build an install DVD that has Crowbar staged
 # on it without having to have a handy Redhat/CentOS environment to build from.
@@ -136,14 +147,14 @@ add_offline_repos() (
 __make_chroot() {
     postcmds=()
     # Install basic packages.
-    for pkg in "${OS_BASIC_PACKAGES[@]}"; do
-        for f in "$(find_cd_pool)/$pkg"-[0-9]*+(noarch|x86_64).rpm; do
+      for pkg in "${OS_BASIC_PACKAGES[@]}"; do
+         for f in "$(__pkg_location)"-[0-9]*+(noarch|x86_64).rpm; do
             rpm2cpio "$f" | \
                 (cd "$CHROOT"; sudo cpio --extract \
                 --make-directories --no-absolute-filenames \
                 --preserve-modification-time)
         done
-        if [[ $pkg =~ (centos|redhat)-release ]]; then
+        if [[ $pkg =~ (centos|redhat|fedora)-release ]]; then
             sudo mkdir -p "$CHROOT/tmp"
             sudo cp "$f" "$CHROOT/tmp/${f##*/}"
             postcmds+=("/bin/rpm -ivh --force --nodeps /tmp/${f##*/}")
@@ -227,7 +238,7 @@ rpmver() {
     [[ -f $1 && $1 = *.rpm ]] || die "$1 is not an rpm!"
     if [[ ! ${SEEN_RPMS["${1##*/}"]} ]]; then
         local ver=$(rpm --queryformat \
-            '%{NAME}-%{ARCH} %{EPOCH}:%{VERSION}-%{RELEASE}' \
+            '%{NAME}.%{ARCH} %{EPOCH}:%{VERSION}-%{RELEASE}' \
             --nodigest --nosignature -qp "$1")
         SEEN_RPMS["${1##*/}"]="${ver// (none):/ }"
     fi
@@ -238,16 +249,6 @@ rpmver() {
 pkg_name() {
     local res="$(rpmver "$1")"
     echo "${res% *}"
-}
-
-# Check to see if package $1 is more recent than package $2
-pkg_cmp() {
-    # $1 = RPM 1
-    # $2 = RPM 2
-    local rpm1=$(rpmver "$1") rpm2="$(rpmver "$2")"
-    [[ ${rpm1% *} = ${rpm2% *} ]] || \
-        die "$1 and $2 do not reference the same package!"
-    vercmp "${rpm1#* }" "${rpm2#* }"
 }
 
 # Copy our isolinux bits into place and append our kickstarts into the initrds.
@@ -268,36 +269,100 @@ final_build_fixups() {
 }
 
 __check_all_deps() {
-    local pkgname pkg token rest bc
+    local pkgname pkg token rest bc ok line
+    local -a lines
+    local token_re='(package|provider):[[:space:]]*([^[:space:]]+)'
     for pkgname in "$@"; do
         local -A deps
-        [[ ${touched_pkgs[$pkgname]} ]] && continue
-        debug "Checking dependencies for $pkgname"
-        while read token rest; do
-            pkg=${rest% *}
+        [[ ${touched_pkgs["$pkgname"]} ]] && continue
+        #debug "Checking dependencies for $pkgname"
+        mapfile -t -n 0 lines < <(in_chroot yum -C deplist "$pkgname")
+        for line in "${lines[@]}"; do
+            [[ $line =~ $token_re ]] || continue
+            token=${BASH_REMATCH[1]}
+            pkg=${BASH_REMATCH[2]}
+            ok=false
+            # We only care about certian arches.
+            for rest in "${PKG_ALLOWED_ARCHES[@]}"; do
+                [[ $pkg = *.$rest ]] || continue
+                ok=true
+                break
+            done
+            [[ $ok = true ]] || continue
             case $token in
-                package:)
-                    [[ ${CD_POOL["${pkg//./-}"]} && \
-                        ! ${INSTALLED_PKGS["${pkg//./-}"]} ]] || continue
-                    debug "Staging depended upon package $pkg"
-                    INSTALLED_PKGS["${pkg//./-}"]="true"
-                    touched_pkgs["${pkg%.*}"]="true";;
-                provider:) [[ ${seen_deps["$pkg"]} ]] && continue
-                    debug "Will check dependent package ${pkg%.*} for $pkgname." 
+                package)
+                    [[ ${CD_POOL["${pkg}"]} && \
+                        ! ${INSTALLED_PKGS["${pkg}"]} ]] || continue
+                    #debug "Staging depended upon package $pkg"
+                    INSTALLED_PKGS["${pkg}"]="true"
+                    touched_pkgs["${pkg}"]="true";;
+                provider) [[ ${seen_deps["$pkg"]} ]] && continue
+                    #debug "Will check dependent package ${pkg} for $pkgname"
+                    INSTALLED_PKGS["${pkg}"]="true"
                     seen_deps["$pkg"]="true"
-                    deps["${pkg%.*}"]="true";;
+                    deps["${pkg}"]="true";;
                 *) continue;;
             esac
-        done < <(in_chroot yum -C deplist "$pkgname")
+        done
         [[ ${!deps[*]} ]] && __check_all_deps "${!deps[@]}"
         unset deps
+        # Add ourselves to the installed_pkgs array if we would not
+        # have been processed by yum above.
+        for rest in "${PKG_ALLOWED_ARCHES[@]}"; do
+            [[ $pkgname = *.$rest ]] || continue
+            INSTALLED_PKGS["$pkgname"]="true"
+            break
+        done
+        printf '.' >&2
     done
 }
 
 check_all_deps() {
     local -A touched_pkgs
     local -A seen_deps
+    debug "Analyzing dependencies for shrinking the install ISO."
     __check_all_deps "$@"
+}
+
+# Throw away packages we will not need on the install media
+shrink_iso() {
+    # Do nothing if we do not have a minimal-install set for this OS.
+    [[ -f $CROWBAR_DIR/$OS_TOKEN-extra/minimal-install ]] || \
+        return 0
+    local pkgname pkgver compfile
+    local -a minimal to_copy
+    while read pkgname pkgver; do
+        minimal+=("$pkgname")
+    done < "$CROWBAR_DIR/$OS_TOKEN-extra/minimal-install"
+    mkdir -p "$BUILD_DIR/Packages"
+    cp -a "$IMAGE_DIR/repodata" "$BUILD_DIR"
+    make_chroot
+    # Make sure all our dependencies will be staged.
+    check_all_deps $(printf "%s\n" "${minimal[@]}" \
+        $(for bc in "${BARCLAMPS[@]}"; do echo ${BC_PKGS[$bc]}; done) | \
+        sort -u)
+    for pkgname in "${!INSTALLED_PKGS[@]}"; do
+        [[ -f ${CD_POOL["$pkgname"]} ]] || continue
+        to_copy+=("${CD_POOL["$pkgname"]}")
+    done
+    debug "Final ISO default CD pool will be shrunk down to:"
+    printf "  %s\n" "${to_copy[@]##*/}" |sort >&2
+    if [[ $OS = fedora ]]; then
+        for pkgname in "${to_copy[@]}"; do
+            # Reorganize packages for fedora ver > 17
+            lowercase_pkgname="${pkgname,,}"
+            mkdir -p "$BUILD_DIR/Packages/${lowercase_pkgname:0:1}"
+            cp "${CD_POOL["$pkgname"]}" "$BUILD_DIR/Packages/${lowercase_pkgname:0:1}"
+        done
+    else
+        cp "${to_copy[@]}" "$BUILD_DIR/Packages"
+    fi
+    sudo mount --bind "$BUILD_DIR" "$CHROOT/mnt"
+    compfile=$(in_chroot find /mnt/repodata -name '*-comps*.xml')
+    in_chroot "cd /mnt; createrepo -g  \"$compfile\" ."
+    sudo umount -l "$CHROOT/mnt"
+    sudo mount -t tmpfs -o size=1K tmpfs "$IMAGE_DIR/Packages"
+    sudo mount -t tmpfs -o size=1K tmpfs "$IMAGE_DIR/repodata"
 }
 
 generate_minimal_install() { : ; }

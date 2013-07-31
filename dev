@@ -1,6 +1,5 @@
 #!/bin/bash
 
-
 export LANG="C"
 export LC_ALL="C"
 
@@ -12,7 +11,7 @@ PULL_TITLE_RE='^(.*)\[([0-9]+)/([0-9]+)\]$'
 readonly currdir="$PWD"
 export PATH="$PATH:/sbin:/usr/sbin:/usr/local/sbin"
 # Ubuntu hack to make sure gem executables are in our path.
-[[ -d /var/lib/gems/1.8/bin ]] && export PATH=$PATH:/var/lib/gems/1.8/bin
+[[ -d /var/lib/gems/1.9.1/bin ]] && export PATH=$PATH:/var/lib/gems/1.9.1/bin
 declare -A DEV_BRANCHES DEV_REMOTE_SOURCES DEV_REMOTE_BRANCHES DEV_ORIGIN_TYPES
 declare -A DEV_REMOTE_PRIORITY DEV_REMOTE_URLBASE __AVAILABLE_REMOTES
 declare -a DEV_SORTED_REMOTES
@@ -72,6 +71,7 @@ VERBOSE=true
 # Location of the Crowbar checkout we are building from.
 [[ $CROWBAR_DIR ]] || CROWBAR_DIR="${0%/*}"
 [[ $CROWBAR_DIR = /* ]] || CROWBAR_DIR="$currdir/$CROWBAR_DIR"
+. "$CROWBAR_DIR/build_lib.sh" || exit 1
 [[ -f $CROWBAR_DIR/build_crowbar.sh && -d $CROWBAR_DIR/.git ]] || \
     die "$CROWBAR_DIR is not a git checkout of Crowbar!"
 [[ $CI_TRACKING_REPO ]] || CI_TRACKING_REPO=ci-tracking
@@ -81,7 +81,6 @@ VERBOSE=true
 export CROWBAR_DIR CROWBAR_TEST_DIR LOCAL_PULL_TRACKING
 export OPEN_PULL_REQUESTS
 
-. "$CROWBAR_DIR/build_lib.sh" || exit 1
 trap - 0 INT QUIT TERM
 trap 'rm -rf "$CROWBAR_TMP"' 0 INT QUIT TERM
 which gem &>/dev/null || \
@@ -97,6 +96,14 @@ shopt -s nullglob
 # A little wrapper for git to help people see what dev is doing.
 git() {
     [[ $SHOW_GIT_OPERATIONS ]] && debug "$PWD: git $@"
+    case $1 in
+        rebase|merge|push|commit)
+            [[ $(git config --get user.name) && $(git config --get user.email) ]] || \
+                die "Git not setup." \
+                "Please run" \
+                "git config --global user.name \"your name\"" \
+                "git config --global user.email \"you@your.domain\"";;
+    esac
     command git "$@"
 }
 
@@ -930,16 +937,11 @@ pull_request_last_touched() (
         for d in *; do
             [[ -d $d ]] || continue
             [[ $ltime ]] || read ltime <"$d/created_at"
-            [[ -f updated_at ]] && read $d/ltime <"$d/updated_at"
             [[ $ltime > $mtime ]] && mtime=$ltime
         done
         echo $mtime
     elif [[ $1 = singletons/* ]]; then
-        if [[ -f $OPEN_PULL_REQUESTS/$1/updated_at ]]; then
-            cat "$OPEN_PULL_REQUESTS/$1/updated_at"
-        else
-            cat "$OPEN_PULL_REQUESTS/$1/created_at"
-        fi
+        cat "$OPEN_PULL_REQUESTS/$1/created_at"
     else
         die "No idea how to find last touched time for $1"
     fi
@@ -1004,20 +1006,20 @@ builds_for_one_pull_request() {
 # This is based on barclamp membership.
 # Returns a list of builds in the order in which they should be built.
 builds_for_pull_request() {
-    local idx id b p release build os repo prq res=() all_oses=()
-    local -A oses build_tmp PULL_REQUEST_BARCLAMPS barclamp_oses build_oses _t _r
+    local idx pr_id b release build os repo prq builds_for_release=() all_oses=()
+    local -A oses valid_builds PULL_REQUEST_BARCLAMPS barclamp_oses build_oses _t _r
     idx=$1
-    id=$(pull_request_number_to_id "$idx") || exit 1
-    prq="$OPEN_PULL_REQUESTS/$id"
+    pr_id=$(pull_request_number_to_id "$idx") || exit 1
+    prq="$OPEN_PULL_REQUESTS/$pr_id"
     read release <"$prq/release"
-    case $id in
+    case $pr_id in
         singletons/*)
             . <(source_prq_vars "$prq" "local")
             if [[ $prq_local_repo = barclamp-* ]]; then
                 PULL_REQUEST_BARCLAMPS[${prq_local_repo#barclamp-}]="$prq_local_branch"
             fi
             for b in $(builds_for_one_pull_request "$prq"); do
-                build_tmp[$b]="build"
+                valid_builds[$b]="build"
             done;;
         bundles/*)
             for repo in "$prq"/*; do
@@ -1026,7 +1028,7 @@ builds_for_pull_request() {
                 [[ $prq_local_repo = barclamp-* ]] && \
                     PULL_REQUEST_BARCLAMPS[${prq_local_repo#barclamp-}]="$prq_local_branch"
                 for b in $(builds_for_one_pull_request "$repo"); do
-                    build_tmp[$b]="build"
+                    valid_builds[$b]="build"
                 done
             done;;
     esac
@@ -1034,18 +1036,25 @@ builds_for_pull_request() {
     # Get all the possible OSes for all possible barclamps in those builds, and use
     # it to derive all the OSes applicable to a build.
     all_oses=($(all_supported_oses))
-    for build in "${!build_tmp[@]}"; do
-        # Start off assuming that all builds can use all OSes
-        unset _t
-        local -A _t
-        for os in "${all_oses[@]}"; do _t[$os]=build; done
+    for build in "${!valid_builds[@]}"; do
+        build_oses[$build]="${all_oses[*]}"
         for b in $(barclamps_in_build "$release/$build"); do
+            if [[ ! -d $CROWBAR_DIR/barclamps/$b/.git ]]; then
+                echo "You are missing the $b barclamp needed for $release/$build. Skipping." >&2
+                valid_builds[$build]=skip
+                continue 2
+            fi
             if ! [[ ${barclamp_oses[$b]} ]]; then
                 local br
                 if [[ ${PULL_REQUEST_BARCLAMPS[$b]} ]]; then
                     br="${PULL_REQUEST_BARCLAMPS[$b]}"
                 else
                     br="$(barclamp_branch_for_build "$release/$build" "$b")"
+                fi
+                if ! in_barclamp "$b" branch_exists "$br"; then
+                    echo "Your $b barclamp in $release/$build does not have branch $br.Skipping." >&2
+                    valid_builds[$build]=skip
+                    continue 2
                 fi
                 p=$(extract_barclamp_metadata "$b" "$br")
                 barclamp_oses[$b]=$(read_barclamp_metadata "$p" "barclamp" "os_support")
@@ -1055,31 +1064,34 @@ builds_for_pull_request() {
                 unset _r
                 local -A _r
                 for os in ${barclamp_oses[$b]}; do _r[$os]=$b; done
-                for os in "${!_t[@]}"; do
+                for os in ${build_oses[$build]}; do
                     [[ ${_r[$os]} ]] && continue
-                    unset _t[$os]
+                    unset _r[$os]
                 done
+                build_oses[$build]="${!_r[*]}"
             fi
         done
-        build_oses[$build]="${!_t[*]}"
     done
     # Now, filter the per-OS lists down to leaf nodes.
-    res=($(builds_in_release "$release"))
+    builds_for_release=($(builds_in_release "$release"))
     # Filter out the builds that will be masked.
-    for id in "${res[@]}"; do
-        [[ ${build_tmp[$id]} ]] || continue
+    local build parent_build
+    for build in "${builds_for_release[@]}"; do
+        [[ ${valid_builds[$build]} ]] || continue
         # Find the parent for this build.
-        p="${DEV_BRANCHES[$id]}"
+        parent_build="$(parent_build "$build")"
         # Special case for the master build.
-        [[ $p = $id ]] && continue
+        [[ $parent_build = $build ]] && continue
         # If we wanted to build the parent for the current build, don't.
         # It will be implicitly tested when we build this build.
-        [[ ${build_tmp[$p]} ]] && build_tmp[$p]=skip
+        if [[ $parent_build && ${valid_builds[$parent_build]} ]]; then
+             valid_builds[$parent_build]=skip
+        fi
     done
     # Display the ones that did not get masked
-    for id in "${res[@]}"; do
-        [[ ${build_tmp[$id]} && ${build_tmp[$id]} = build ]] || continue
-        echo "$release/$id: ${build_oses[$id]}"
+    for build in "${builds_for_release[@]}"; do
+        [[ ${valid_builds[$build]} && ${valid_builds[$build]} = build ]] || continue
+        echo "$release/$build: ${build_oses[$build]}"
     done
 }
 
@@ -1100,6 +1112,7 @@ show_pull_request() {
             builds=($(builds_in_release "$prq_release"))
         fi
         echo "Title:               $prq_title"
+        echo "Unique ID            $id"
         echo "Target Account:      $prq_target_account"
         echo "Source Account:      $prq_source_account"
         echo "Release:             $prq_release"
@@ -1161,8 +1174,13 @@ list_pull_requests() {
         [[ -d $OPEN_PULL_REQUESTS/$id ]] || continue
         cf="$OPEN_PULL_REQUESTS/$id/title"
         cr="$OPEN_PULL_REQUESTS/$id/release"
+        if [[ -f $OPEN_PULL_REQUESTS/$id/number ]]; then
+            cn=" $(cat $OPEN_PULL_REQUESTS/$id/number)"
+        else
+            cn=""
+        fi
         ct="${id%%/*}"
-        echo "$idx: ($(cat "$cr")) $(cat "$cf")"
+        echo "$idx: ($(cat "$cr")$cn) $(cat "$cf")"
     done <"$OPEN_PULL_REQUESTS/pull_request_index"
 }
 
@@ -1184,7 +1202,7 @@ pull_request_switch_one() (
         crowbar) cd "$CROWBAR_DIR";;
     esac
     pull_request_checkout_one "$1" || exit 1
-    git checkout "$(git rev-parse HEAD)"
+    git checkout -q "$(git rev-parse HEAD)"
     git merge "$(git rev-parse "$prq_target_branch")" && return 0
     git merge --abort
     die "Could not merge $prq_target_branch into $prq_local_branch!"
@@ -1239,11 +1257,60 @@ pull_request_switch() {
             done;;
     esac
     if ((res == 0)); then
-            debug "You are now on build $build in pull request $idx."
+        debug "You are now on build $build in pull request $idx."
+        debug "Remember to use the --no-switch flag to ./dev build."
+        debug "./dev switch will throw away the current tree state when you are finished."
     else
         switch_release
         die "Pull request $idx does not merge cleanly.  It should be updated or closed."
     fi
+}
+
+pull_request_multiswitch_one() (
+    local merge_res
+    . <(source_prq_vars "$1" "local")
+    case $prq_local_repo in
+        barclamp-*) cd "$CROWBAR_DIR/barclamps/${prq_local_repo#barclamp-}";;
+        crowbar) cd "$CROWBAR_DIR";;
+    esac
+    debug "Merging $prq_github_url into $prq_local_repo"
+    [[ -f README.empty-branch ]] && exit 0
+    git checkout -q "$(git rev-parse HEAD)" &>/dev/null
+    merge_res=$(git merge "$(git rev-parse "$prq_local_branch")") && return 0
+    git merge --abort
+    echo "$merge_res"
+    return 1
+)
+
+# Switch to a loal tree consisting of the contents of a bunch of pull requests
+# merged in together.  This is less intelligent than pull_requests_switch, but
+# should allow for fater testing of tightly related pull requests.
+pull_request_multiswitch() {
+    local base_build=$1 prq_id id res=0 prq
+    shift
+    crowbar_is_clean || die "Trees must be clean before starting a multiswitch"
+    switch_release "$base_build" || die "Cannot switch to $base_build"
+    for prq_id in "$@"; do
+        id=$(pull_request_number_to_id "$prq_id") ||  \
+            die "$id is not a valid pull request. dev pull-requests list will help."
+        [[ $id ]] || die "Cannot translate $prq_id into a pull request handle!"
+        prq="$OPEN_PULL_REQUESTS/$id"
+        case $id in
+            singletons/*)
+                pull_request_multiswitch_one "$prq" || res=1;;
+            bundles/*)
+                for repo in "$prq"/*; do
+                    [[ -d $repo ]] || continue
+                    ((res == 0)) && \
+                        pull_request_multiswitch_one "$repo" || res=1
+                done;;
+            *) die "Cannot happen in pull_requests_multiswitch: prq_id";;
+        esac
+        ((res != 0)) && die "Failed to merge $prq_id"
+    done
+    debug "All pull requests merged locally."
+    debug "Remember to use the --no-switch flag to ./dev build."
+    debug "./dev switch will throw away the current tree state."
 }
 
 pull_request_merge_one () {
@@ -1254,13 +1321,14 @@ pull_request_merge_one () {
         "https://api.github.com/repos/$prq_target_account/$prq_local_repo/pulls/$prq_number/merge" &>/dev/null; then
         return 0
     fi
+    json="{\"commit_message\": \"$prq_github_url\n\nMerged by devtool for $DEV_GITHUB_ID\"}"
     if curl_and_res -f -X PUT \
-	-d "{\"commit_message\": \"Merged by devtool for $DEV_GITHUB_ID\"}" \
+	-d "$json" \
         "https://api.github.com/repos/$prq_target_account/$prq_local_repo/pulls/$prq_number/merge" &>/dev/null; then
-        debug "$(cat "$1/github_url") merged."
+        debug "$prq_github_url merged."
         return 0
     else
-        debug "Merge of $(cat "$1/github_url") failed."
+        debug "Merge of $prq_github_url failed."
         return 1
     fi
 }
@@ -1437,6 +1505,7 @@ fetch_ci_tracking() (
 
 # Push CI tracking to the upstream repository.
 push_ci_tracking() (
+    [[ $SKIP_CI_PUSH ]] && return 
     local remote
     fetch_ci_tracking || return $?
     cd "$LOCAL_PULL_TRACKING"
@@ -1614,7 +1683,7 @@ ci_all_next_states() {
         merge-tested)
             while read build oses; do
                 build="${build%:}"
-                if [[ ${unit_test_whitelist["$release"]} ]]; then
+                if [[ ${unit_test_whitelist["$release"]} && $build = $release/master ]]; then
                     next+=("unit-testing $build")
                 else
                     for os in $oses; do
@@ -1627,11 +1696,13 @@ ci_all_next_states() {
             build="${current_state#* }"
             next=("unit-tested $build");;
         unit-tested*)
-            build="${current_state#* }"
+            b="${current_state#* }"
             while read build oses; do
                 build=${build%:}
                 if [[ $build != $b ]]; then continue; fi
-                next+=("build-testing $build $os")
+                for os in $oses; do
+                    next+=("build-testing $build $os")
+                done
             done < <(builds_for_pull_request "$id");;
         # Build and smoke tests happen on a release/build/os basis.
         build-testing*)
@@ -1657,7 +1728,7 @@ ci_all_next_states() {
         merged|closed) next=();;
         *) die "Unknown state $current_state!";;
     esac
-    printf "%s\n" "${next[@]}"
+    [[ $next ]] && printf "%s\n" "${next[@]}"
 }
 
 # Print any passed args in pseudo-random order
@@ -1710,7 +1781,7 @@ ci_get_current_states() {
     # This needs to be ornate-ified to handle per-state special conditions.
     for state in "${!states[@]}"; do
 	# If this state has no last_states, then it is current.
-	[[ -d $LOCAL_PULL_TRACKING/$id/ci_state/$state/last_states ]] || continue
+	[[ -d $LOCAL_PULL_TRACKING/$id/ci_state/$state/last_states || $state = new ]] || continue
 	# If we have intents, and some of them are unfulfilled,
 	# we are not stale.
 	if [[ -d $LOCAL_PULL_TRACKING/$id/ci_state/$state/intents ]]; then
@@ -1774,7 +1845,7 @@ ci_kill_stale_intents() (
 	    touch "$intent/.intent"
 	    git add "$intent/.intent"
 	}
-        (cd "$intent"; git rm -f timeout +([[:xdigit:]]))
+        (cd "$intent"; git rm -f timeout +([[:xdigit:]])) &>/dev/null
         need_commit=true
     done < <(find -name timeout -type f)
     [[ $need_commit = true ]] || return 1
@@ -1801,13 +1872,6 @@ ci_register_intent() {
         debug "$id already has state $3"
         return 1
     }
-    while read state; do
-        [[ $state = $2 ]] || continue
-        state_ok=true
-        break
-    done < <(ci_get_current_states "$1")
-    [[ $state_ok = true ]] || \
-        die "$id is not in state $2, cannot register an intent for it."
     state_ok=false
     while read state; do
         [[ $state = $3 ]] || continue
@@ -1818,6 +1882,7 @@ ci_register_intent() {
         die "$id: State $2 does not have a next state of $3, cannot register an intent."
     # See if we need to expire intents on the current state.
     if [[ -f $prq/ci_state/$2/intents/$3/timeout ]]; then
+        [[ $timeout = 0 ]] && return 1
         ci_kill_stale_intents "$id" && push_ci_tracking && \
             [[ ! -f $prq/ci_state/$2/intents/$3/timeout ]] || return 1
     fi
@@ -1845,6 +1910,8 @@ ci_handle_intent() {
     [[ ${intents[1]} ]] && \
         die "More than one intent with id $1 found. This should never happen." \
         "${intents[@]}"
+    [[ ${intents[0]} ]] || \
+	die "Intent $1 not found."
     intent="${intents[0]#$LOCAL_PULL_TRACKING/}"
     local prq="${intent%%/ci_state/*}"
     intent="${intent#${prq}/ci_state/}"
@@ -1861,13 +1928,12 @@ ci_handle_intent() {
                 "Intent to transition from $current_state to $next_state failed."
             for state in "${states[@]}"; do
                 ci_link_state "$prq" "$state" failed
-            done
-            pull_request_comment "$prq" "ci: gating tests for $current_state to $next_state failed.";;
+            done;;
 	passed)
             __ci_set_state "$prq" "$next_state" \
 		"Intent to transition from $current_state to $next_state passed."
-            ci_link_state "$prq" "$current_state" "$next_state"
-            pull_request_comment "$prq" "CI: Gating tests for $current_state to $next_state passed.";;
+            ci_link_state "$prq" "$current_state" "$next_state";;
+
 	expire) (cd "$LOCAL_PULL_TRACKING/$prq/ci_state/$current_state/intents/$next_state/"
 		[[ -f .intent ]] || {
 		    touch .intent
@@ -1883,10 +1949,16 @@ ci_handle_intent() {
     esac
 }
 
-ci_commit_intent() { ci_handle_intent "$1" "passed"; }
-ci_fail_intent() { ci_handle_intent "$1" "failed"; }
-ci_expire_intent() { ci_handle_intent "$1" "expire"; }
-ci_delete_intent() { ci_handle_intent "$1" "delete"; }
+ci_commit_intent() {
+    ci_do_and_push ci_handle_intent "$1" "passed" || return $?
+    pull_request_comment "$prq" "CI: Gating tests for $current_state to $next_state passed."
+}
+ci_fail_intent() {
+    ci_do_and_push ci_handle_intent "$1" "failed" || return $?
+    pull_request_comment "$prq" "ci: gating tests for $current_state to $next_state failed."
+}
+ci_expire_intent() { ci_do_and_push ci_handle_intent "$1" "expire"; }
+ci_delete_intent() { ci_do_and_push ci_handle_intent "$1" "delete"; }
 
 # Show all incomplete intents for a CI ID.
 ci_show_intents() (
@@ -2030,7 +2102,7 @@ ci_import_new_pull_requests() {
         debug "Adding new pull request $id"
         (   cd "$LOCAL_PULL_TRACKING/$id"
             git add .
-            git commit -qm "Added new pull request $id")
+            git commit -qm "Added new pull request $id") &>/dev/null
     done < "$OPEN_PULL_REQUESTS/pull_request_index"
 }
 
@@ -2053,7 +2125,7 @@ __fetch_all() {
             remote_available "$remote" && \
             git_remote_exists "$remote" || \
             continue
-	if git fetch -q "$remote" &>/dev/null; then
+	if { git fetch -q "$remote" && git fetch -q -t "$remote"; } &>/dev/null; then
             debug "  Fetched from $remote." 2>>"$results_dir/$logfile"
             printf '.'
             if [[ $PWD = */barclamps/* ]]; then
@@ -2478,6 +2550,7 @@ migrate() {
 # Perform initial setup.  If you make any changes to this function, take
 # care to make sure it stays idempotent.
 setup() {
+    dev_bash_completion
     local p remote release br head
     local -A touched_branches barclamps
     [[ $(in_repo git symbolic-ref HEAD) = refs/heads/master ]] || \
@@ -2795,33 +2868,68 @@ merge_or_rebase_from_remote() {
     return 1
 }
 
+merge_one_release() (
+    [[ $1 && $2 && $3 ]] || die "Not enough params!"
+    cd "$CROWBAR_DIR/barclamps/$1"
+    local t s
+    s="$(barclamp_branch_for_build "$2" "$1")"
+    t="$(barclamp_branch_for_build "$3" "$1")"
+    [[ $s && $t && $s != empty-branch && $t != empty_branch ]] || return 0
+    quiet_checkout "$s" || return 1
+    debug "Merging $3 into $2 in barclamp $1"
+    git merge -q "$t" && return 0
+    echo "Barclamp ${1}:"
+    echo "  Merging branch $t into $s failed."
+    echo "  Dropping to a shell for you to fix up."
+    echo "  If you want to abort this merge, exit the shell with 'exit 1'"
+    /bin/bash && return 0
+    git merge --abort
+    return 2
+)
+
 # Handle merges across releases.
 merge_releases() {
-    # $@ = releases to merge.
-    local rel branch start_ref build bc
+    # $@ = releases to merge into the current release
+    local rel branch head build bc thisrel res
+    local -A current_barclamps current_builds
+    thisrel=$(current_release)
     bc="${repo##*/}"
-    start_ref=$(git rev-parse HEAD)
+    current_release_br=$()
+    for bc in $(barclamps_in_release "$thisrel"); do
+        current_barclamps[$bc]="$thisrel"
+    done
+    for build in $(builds_in_release "$thisrel"); do
+        current_builds[$build]="$thisrel"
+    done
     for rel in "$@"; do
-	[[ $rel ]] || continue
-	[[ $rel = $(current_release) ]] &&  continue
-	release_exists "$rel" || continue
-        for branch in $(barclamp_branches_for_release "$rel" "$bc"); do
-	    git merge -q "$branch" && continue
-	    git merge --abort
-	    {
-                echo "Barclamp ${repo##*/}:"
-	        echo "  Merging releases $@ into $(current_release) failed."
-	        echo "  Dropping to a shell for you to fix up."
-	        echo "  If you want to abort this merge, exit the shell with 'exit 1'"
-	        /bin/bash
-	    } || {
-	        git merge --abort
-	        git branch "${head#refs/heads/}" "$start_ref"
-	        debug "Barclamp ${repo##*/}: Merge of $br from $rel into $cur_rel failed."
-                return 1
-	    }
+        [[ $rel && $rel != $thisrel ]] && release_exists "$rel" || continue
+        for build in $(builds_in_release "$rel"); do
+            [[ ${current_builds[$build]} ]] || continue
+            for bc in $(barclamps_from_build "$rel/$build"); do
+                [[ ${current_barclamps[$bc]} ]] || continue
+                head=$(git symbolic-ref HEAD)
+                if [[ $head != refs/heads/* ]]; then
+                    head=$(git rev-parse HEAD)
+                    if [[ ! $head ]]; then
+                        debug "Barclamp ${repo##*/}: Cannot find head commit."
+                        return 1
+                    fi
+                else
+                    head=${head#refs/heads/}
+                fi
+                merge_one_release "$bc" "$thisrel/$build" "$rel/$build"
+                res=$?
+                in_barclamp "$bc" git checkout -q -f "${head}"
+                case $res in
+                    1) debug "No branch for $thisrel/$build in $bc to merge into. Skipping.";;
+                    2) debug "Barclamp ${repo##*/}: Merge of $br from $rel into $thisrel failed."
+                        return 1;;
+                esac
+            done
         done
     done
+    debug "Releases $* merged into $thisrel"
+    debug "You will need to update the metadata manually."
 }
 
 # Merges in changes into all local branches from their upstreams.
@@ -2857,10 +2965,6 @@ sync_repo() (
         debug "Merge conflicts detected when syncing barclamp ${repo##*/} with $remote."
         debug "Please fix them up locally and retry the sync operation."
         return 1
-    fi
-    if [[ $@ ]] && ! merge_releases "$@"; then
-        debug "Unfixed merge conflicts while merging releases."
-        return 2
     fi
     return 0
 )
@@ -2943,6 +3047,32 @@ dev_short_help() {
     echo 'README.dev-and-workflow has a general overview of the dev tool.'
     echo 'To see all the help at once, run dev help all'
 }
+
+
+dev_bash_completion() { 
+  cmds=$(printf "%s" "${!DEV_COMMANDS[*]}"; )
+cat > ~/.bash_completion <<EOF
+_dev()
+{
+  local cur prev opts
+  COMPREPLY=()
+  cur="\${COMP_WORDS[COMP_CWORD]}"
+  prev="\${COMP_WORDS[COMP_CWORD-1]}"
+  opts="${cmds}"
+    
+  #opts="--help --verbose --version"
+      
+  #if [[ \${cur} == -* ]] ; then
+  COMPREPLY=( \$(compgen -W "\${opts}" -- \${cur}) )
+  return 0
+  #fi
+}
+complete -F _dev dev
+EOF
+
+  
+}
+
 
 dev_help () {
     (
@@ -3032,8 +3162,22 @@ pull_requests_prep() {
     remote_available personal && remote_is_github personal || \
 	die "No personal remote available at Github.  Cannot do pull requests."
     barclamps_are_clean || exit 1
-    fetch_all && sync_everything || \
-	die "Unable to synchronize remotes for pull requests"
+    local skip_sync merge
+    while (( $# > 0)); do
+	case $1 in
+	    --skip-sync)
+		skip_sync=true
+		shift;;
+	    --merge)
+		merge=true
+		shift;;
+        esac
+    done
+
+    if ! [[ $skip_sync ]]; then
+	fetch_all && sync_everything || \
+	    die "Unable to synchronize remotes for pull requests"
+    fi
     local barclamps_to_push=()
     local to_remote="$(origin_remote)"
     [[ $DEV_TO_REMOTES ]] && to_remote="$DEV_TO_REMOTES"
@@ -3041,7 +3185,7 @@ pull_requests_prep() {
 	die "Cannot issue pull requests for $to_remote, it is not from github."
     local branch bc build release=$(current_release)
     local target_release="$release"
-    if [[ $1 = --merge ]]; then
+    if [[ $merge ]]; then
         target_release="$(find_best_parent "$release")" || \
             die "No parent release to merge into!"
         echo "Will generate pull requests for merge $release into $target_release" >&2
@@ -3172,8 +3316,11 @@ pull_requests_gen() {
                 release_exists "$1" || die "$1 is not a release"
                 release="$1"
                 shift;;
-            --merge) shift; merge_into_parent=true;;
-	    *) die "Unknown option $1 to $0 pull-requests-gen!";;
+	    --merge)
+		shift
+		merge_into_parent=true;;
+	    *)
+		die "Unknown option $1 to $0 pull-requests-gen!";;
 	esac
     done
 
@@ -3262,7 +3409,7 @@ pull_requests_gen() {
     # Now, issue the requests for branches.
     # Make sure they are ordered correctly.
     for br in "${!br_pulls[@]}"; do
-        local br_pull_name="$(in_repo git_ref "$br" "$pull_id")"
+        local br_pull_name="pull-req-$(in_repo git_ref "$br" "$pull_id")"
 	in_repo git_push personal "${br}:${br_pull_name}"
 	local br_head="$DEV_GITHUB_ID:${br_pull_name}"
 	do_pull_request \
@@ -3347,7 +3494,7 @@ find_best_parent() {
     local best_candidates=()
     if [[ $1 ]]; then
 	release_exists "$1" || \
-	    die "find_best_parents: $1 is not a release"
+	    die "find_best_parent: $1 is not a release"
 	release="$1"
     else
 	release="$(current_release)"
@@ -3449,8 +3596,10 @@ cut_release() {
     debug "You can switch to it with $0 switch $1"
 }
 
-cut_feature() {
+new_feature() {
     [[ $1 ]] || die "Please give your new feature a name!"
+    [[ $2 ]] && die "new-feature only takes one parameter."
+
     cut_release "feature/$1"
 }
 
@@ -3490,6 +3639,7 @@ erase_release() {
     # $1 = release refix
     local bc build whine=false current_br parent_br template_br
     local -A branches
+    [[ $2 ]] && die "erase-feature only takes one argument"
     [[ $1 = development ]] && die "Cannot erase the development release."
     release_exists "$1" || die "$1 is not a release we can erase!"
     parent=$(find_best_parent "$1")
@@ -3550,7 +3700,7 @@ maybe_checkout_build_cache_branch() {
     rel_br="$(release_branch "${1:-$(current_release)}")" || \
         die "Cannot find release branch for $1"
     update_cache_tracking_branches
-    if in_cache branch_exists "$rel_br"; then
+    if in_cache git show-ref | grep -q "$rel_br"; then
 	debug "Checking out $rel_br in the build cache, please be patient."
 	in_cache quiet_checkout -f "$rel_br"
     fi
@@ -3591,6 +3741,7 @@ build_crowbar() {
     maybe_checkout_build_cache_branch
     with_build_lock exec "$CROWBAR_DIR/build_crowbar.sh" \
 	"$target_os" "${build_args[@]}"
+    echo "Build process took ${SECONDS} seconds."
 }
 
 # Reset a branch to another ref.
@@ -3779,23 +3930,29 @@ purge_submodule_metadata() (
 
 # Unit testing functions:
 
-unit_prereqs_installed() {
-    local f gem
-    f=true
-    if ! command -v markdown >/dev/null 2>&1; then
-        debug "Please make sure markdown is installed."
-        f=false
-    fi
+test_prereqs_installed() {
+    local -a missing
+
     if [[ ! $(find /usr/include -name 'sqlite3.h') ]]; then
-        debug "sqlite development headers not installed."
-        f=false
+        missing+=("sqlite development headers not installed.")
     fi
-    for gem in kwalify bundler rake rcov rspec; do
-        gem list |grep -q "$gem" && continue
-        debug "Please install the $gem gem."
-        f=false
+
+    local rvm=/usr/local/rvm/scripts/rvm
+    [ -f $rvm ] && source $rvm
+
+    for cmd in bundle erlc; do
+        if ! command -v $cmd >/dev/null 2>&1; then
+            missing+=("$cmd not installed")
+        fi
     done
-    [[ $f = true ]]
+
+    if [[ $missing ]]; then
+        warn "Missing dependencies: ${missing[@]}"
+        warn "Please see: https://github.com/crowbar/crowbar/blob/master/doc/devguide/dev-vm.md#setting-up-the-virtual-machine"
+        return 1
+    fi
+
+    return 0
 }
 
 paths_same() {
@@ -3809,8 +3966,8 @@ paths_same() {
 
 barclamp_needs_reinstall() {
     # $1 = name of the barclamp
-    [[ -f $CROWBAR_TEST_DIR/barclamps/$1/crowbar.yml ]] || return 0
-    ! paths_same "$CROWBAR_TEST_DIR/barclamps/$1" "$CROWBAR_DIR/barclamps/$1"
+    [[ -f $CROWBAR_TEST_DIR/opt/dell/barclamps/$1/crowbar.yml ]] || return 0
+    ! paths_same "$CROWBAR_TEST_DIR/opt/dell/barclamps/$1" "$CROWBAR_DIR/barclamps/$1"
 }
 
 barclamps_needing_reinstall() {
@@ -3825,16 +3982,16 @@ barclamps_needing_reinstall() {
 databases_need_reload() {
     # $@ = list of barclamps to check for new migrations
     local bc barclamps=() p
-    [[ -f $CROWBAR_TEST_DIR/crowbar_framework/db/test.sqlite3 && \
-        $CROWBAR_TEST_DIR/crowbar_framework/db/development.sqlite3 ]] || \
+    [[ -f $CROWBAR_TEST_DIR/opt/dell/crowbar_framework/db/test.sqlite3 && \
+        $CROWBAR_TEST_DIR/opt/dell/crowbar_framework/db/development.sqlite3 ]] || \
         return 0
     [[ $@ ]] && barclamps=("$@") || barclamps=($(barclamps_needing_reinstall))
     for bc in "${barclamps[@]}"; do
         for p in "crowbar_framework/db" "crowbar_framework/test/fixtures" \
             "chef/data_bags"; do
-            [[ -d "$CROWBAR_DIR/barclamps/$1/$p" ]] || continue # ignore if dir not there.
-            paths_same "$CROWBAR_TEST_DIR/barclamps/$1/$p" \
-                "$CROWBAR_DIR/barclamps/$1/$p" && continue
+            [[ -d "$CROWBAR_DIR/opt/dell/barclamps/$1/$p" ]] || continue # ignore if dir not there.
+            paths_same "$CROWBAR_TEST_DIR/opt/dell/barclamps/$1/$p" \
+                "$CROWBAR_DIR/opt/dell/barclamps/$1/$p" && continue
             debug "Database files changed in $bc, need reload."
             return 0
         done
@@ -3849,37 +4006,73 @@ reinstall_barclamps() {
         debug "No barclamps changed."
         return 0
     fi
+    mkdir -p "$CROWBAR_TEST_DIR/opt/dell/barclamps"
     for bc in "${barclamps[@]}"; do
-        rm -rf "$CROWBAR_TEST_DIR/barclamps/$bc"
-        barclamp_list+=("$CROWBAR_DIR/barclamps/$bc")
+        rm -rf "$CROWBAR_TEST_DIR/opt/dell/barclamps/$bc"
+        cp -a "$CROWBAR_DIR/barclamps/$bc" "$CROWBAR_TEST_DIR/opt/dell/barclamps"
     done
     debug "${barclamps[*]} barclamps have changed, reloading."
-    (   cd ${CROWBAR_DIR}/releases/$build/extra
-        ./barclamp_install.rb --force --no-files --no-chef -b \
-            "$CROWBAR_TEST_DIR" "${barclamp_list[@]}") || \
+    (   cd "$CROWBAR_TEST_DIR/opt/dell/barclamps"
+        "${CROWBAR_DIR}/releases/$build/extra/barclamp_install.rb" \
+            --build --force --root "$CROWBAR_TEST_DIR" "${barclamps[@]}") || \
             die "Failed to install some barclamps."
 
-    local group=$USER
-    [ -f /etc/SuSE-release ] && group=users
-    sudo chown -R "$USER.$group" "${CROWBAR_TEST_DIR}"
-
     find "$CROWBAR_TEST_DIR" -type d -exec chmod a+x '{}' ';'
-    # Clean up the filelists.
-    rm barclamps/*.txt
-    "$CROWBAR_TEST_DIR/bin/validate_bags.rb" \
-        "$CROWBAR_TEST_DIR/chef/data_bags" || \
-        die "Crowbar configuration has errors.  Please fix and rerun install."
 }
 
-unit_tests_need_reset() {
+validate_data_bags() {
+    # This requires the gems to be installed
+    cd "$CROWBAR_TEST_DIR/opt/dell/crowbar_framework"
+    for d in "$CROWBAR_TEST_DIR/opt/dell/barclamps/"*; do
+        [[ -d $d/chef/data_bags ]] || continue
+        debug "Validating data bags for $d ..."
+        bundle exec "$CROWBAR_TEST_DIR/opt/dell/bin/validate_bags.rb" \
+            "$d/chef/data_bags" || \
+        die "Crowbar configuration in barclamp ${d##*/} has errors.  Please fix and rerun install."
+    done
+}
+
+test_env_needs_reset() {
     ! [[ -f $CROWBAR_TEST_DIR/.build && \
         $(cat "$CROWBAR_TEST_DIR/.build") = $(current_build) ]]
 }
 
+install_gems() {
+    local gemfile="$CROWBAR_TEST_DIR/opt/dell/crowbar_framework/Gemfile"
+    if [[ $use_gem_cache = true ]]; then
+        maybe_checkout_build_cache_branch
+        [[ -d $CROWBAR_TEST_DIR/gemsite ]] && \
+            rm -rf "$CROWBAR_TEST_DIR/gemsite/gems"
+        mkdir -p "$CROWBAR_TEST_DIR/gemsite/gems"
+        find "$CACHE_DIR/barclamps" -type f -name '*.gem' \
+            -exec cp '{}' "$CROWBAR_TEST_DIR/gemsite/gems" ';'
+        (   cd "$CROWBAR_TEST_DIR/gemsite/"
+            gem generate_index)
+        sed -i -e "s@^source .*@source \"file://$CROWBAR_TEST_DIR/gemsite\"@" "$gemfile"
 
-setup_unit_tests() (
+        debug "** Installing gems via bundler ..."
+        bundle install --path "$CROWBAR_TEST_DIR/gems" --gemfile "$gemfile" || \
+            die "Not all required gems are present." \
+            "Please run again with --no-gem-cache or --update-gem-cache." \
+            "If that does not work, then you will need to add the missing gems to:" \
+            "$CROWBAR_DIR/barclamps/crowbar/crowbar.yml"
+        debug
+    else
+        sed -i -e "s@^source .*@source \"https://rubygems.org\"@" "$gemfile"
+        echo "NOTE: Using the --no-gem-cache option means that the gems used to"\
+        "run the unit tests may not be the same as the ones used to build and"\
+        "install Crowbar, so results may differ."
+
+        debug "** Installing gems via bundler ..."
+        bundle install --path "$CROWBAR_TEST_DIR/gems" --gemfile "$gemfile" || \
+            die "Not all required gems are present."
+        debug
+    fi
+}
+
+setup_test_env() (
     local gem f bc barclamps=()
-    local gem_offline=true update_gem_cache=false use_gem_cache=true
+    local update_gem_cache=false use_gem_cache=true
     for f in "$@"; do
         case $f in
             --update-gem-cache) update_gem_cache=true;;
@@ -3887,27 +4080,11 @@ setup_unit_tests() (
             *) barclamps+=("$f");;
         esac
     done
-    if [[ $use_gem_cache = true ]]; then
-        unit_prereqs_installed || exit 1
-    else
-        local rvm=/usr/local/rvm/scripts/rvm
-        [ -f $rvm ] && source $rvm
-        if command -v bundle >/dev/null 2>&1; then
-            debug "** Installing minimal dev setup dependencies..."
-            bundle install --gemfile=dev-setup/Gemfile
-            [ $? -eq 0 ] || die "Failed to install gem dependencies"
-            debug
-        else
-            die "Please make sure bundler is installed. Eg. 'sudo gem install bundler'"
-        fi
-    fi
+    test_prereqs_installed || exit 1
     rm -rf "$CROWBAR_TEST_DIR"
     mkdir "$CROWBAR_TEST_DIR"
-    mkdir -p "$CROWBAR_TEST_DIR/doc/framework"
-    cp -r doc/* "$CROWBAR_TEST_DIR/doc/framework"
     reinstall_barclamps "${barclamps[@]}" || exit 1
     cd "$CROWBAR_TEST_DIR"
-    mv crowbar_framework/Gemfile* .
     if [[ $update_gem_cache = true ]]; then
         maybe_checkout_build_cache_branch
         local crowbar_yml
@@ -3923,39 +4100,25 @@ setup_unit_tests() (
     fi
     unset update_gem_cache
 
-    if [[ $use_gem_cache = true ]]; then
-        maybe_checkout_build_cache_branch
-        [[ -d $CROWBAR_TEST_DIR/gemsite ]] && \
-            rm -rf "$CROWBAR_TEST_DIR/gemsite/gems"
-        mkdir -p "$CROWBAR_TEST_DIR/gemsite/gems"
-        find "$CACHE_DIR/barclamps" -type f -name '*.gem' \
-            -exec cp '{}' "$CROWBAR_TEST_DIR/gemsite/gems" ';'
-        (   cd "$CROWBAR_TEST_DIR/gemsite/"
-            gem generate_index)
-        sed -ie "s@^source .*@source \"file://$CROWBAR_TEST_DIR/gemsite\"@" "Gemfile"
+    install_gems
+    validate_data_bags
 
-        bundle install --path "$CROWBAR_TEST_DIR/gems" || \
-            die "Not all required gems are present." \
-            "Please run again with --update-gem-cache." \
-            "If that does not work, then you will need to add the missing gems to:" \
-            "$CROWBAR_DIR/barclamps/crowbar/crowbar.yml"
-    else
-        sed -ie "s@^source .*@source \"http://rubygems.org\"@" "Gemfile"
-        echo "NOTE: Using the --no-gem-cache option means that the gems used to"\
-        "run the unit tests may not be the same as the ones used to build and"\
-        "install Crowbar, so results may differ."
-    fi
+    mkdir -p "$CROWBAR_TEST_DIR/doc/framework"
+    echo "Copying base docs from $CROWBAR_DIR/doc/. to $CROWBAR_TEST_DIR/opt/dell/doc/framework"
+    cp -r "$CROWBAR_DIR/doc/." "$CROWBAR_TEST_DIR/opt/dell/doc/framework"
 
-    cd "$CROWBAR_TEST_DIR/BDD"
-    sudo "$CROWBAR_TEST_DIR/BDD/linux_install.sh"
+    debug "Setting up public/coverage symlink"
+    ln -sf ../coverage "$CROWBAR_TEST_DIR/opt/dell/crowbar_framework/public"
+
+    cd "$CROWBAR_TEST_DIR/opt/dell/BDD"
     ./linux_compile.sh
     current_build >"$CROWBAR_TEST_DIR/.build"
 )
 
-reload_unit_tests() (
+reload_test_env() (
   local rake_task barclamps dbs_need_reload
-  if unit_tests_need_reset; then
-      setup_unit_tests || exit 1
+  if test_env_needs_reset; then
+      setup_test_env || exit 1
   fi
   barclamps=($(barclamps_needing_reinstall "$@"))
 
@@ -3965,49 +4128,108 @@ reload_unit_tests() (
       return 0
   fi
   reinstall_barclamps "${barclamps[@]}" || exit 1
+  validate_data_bags
+
   if [[ $dbs_need_reload ]]; then
-      cd "$CROWBAR_TEST_DIR/crowbar_framework"
-      for rake_task in db:drop db:migrate db:fixtures:dump; do
-          for RAILS_ENV in test development; do
-              (export RAILS_ENV; bundle exec rake "$rake_task")
-          done
+      cd "$CROWBAR_TEST_DIR/opt/dell/crowbar_framework"
+
+      # For some bizarre reason, rake db:drop in development
+      # also drops the test database.
+      # https://github.com/rails/rails/pull/2419
+      export RAILS_ENV=development
+      bundle exec rake db:drop
+
+      # If you change these, don't forget to also update .travis.yml and
+      # doc/devguide/testing!
+      for RAILS_ENV in test development; do
+          debug "Setting up DB for $RAILS_ENV environment ..."
+          (
+              export RAILS_ENV
+              bundle exec rake \
+                  railties:install:migrations \
+                  db:migrate \
+                  db:fixtures:dump \
+                  RAILS_ENV=$RAILS_ENV
+          )
       done
   fi
-  cd "$CROWBAR_TEST_DIR/BDD"
+  cd "$CROWBAR_TEST_DIR/opt/dell/BDD"
   ./linux_compile.sh
 )
 
+run_server() {
+  auto_reload_test_env
+  cd "$CROWBAR_TEST_DIR/opt/dell/crowbar_framework"
+  echo "Starting Rails app"
+  RAILS_ENV=development bundle exec script/rails s Puma development
+}
+
+run_console() {
+  auto_reload_test_env
+  cd "$CROWBAR_TEST_DIR/opt/dell/crowbar_framework"
+  echo "Starting Rails console"
+  RAILS_ENV=development bundle exec script/rails c
+}
+
+run_tests() {
+    run_unit_tests
+    run_BDD_tests
+}
+
+auto_reload_test_env() {
+    test_env_needs_reset && clear_test_env
+    reload_test_env "$@" || exit 1
+}
+
 run_unit_tests() (
-    local barclamps=($(barclamps_needing_reinstall "$@"))
     local final_result=pass
-    unit_tests_need_reset && clear_unit_tests
-    rm -f "$CROWBAR_TEST_DIR/crowbar_framework/Gemfile" # Use the parent directory gemfile
-    reload_unit_tests "$@" || exit 1
+
+    clear # Arkady added this line to fix failing unit tests. Probably better to beef up test_env_needs_reset.
+    
+    auto_reload_test_env
+
     # Run unit tests
-    cd "$CROWBAR_TEST_DIR/crowbar_framework"
+    cd "$CROWBAR_TEST_DIR/opt/dell/crowbar_framework"
     rm -rf coverage
     mkdir coverage
-    bundle exec rcov --aggregate coverage/testing.data -Ispec:lib \
-        --exclude /gems/,/Library/,/usr/,lib/tasks,.bundle,/config/,/lib/rspec/,/lib/rspec-,spec \
-        spec/*/*.rb || final_result=fail
-    bundle exec rcov --aggregate coverage/testing.data -Itest:lib \
-        --exclude /gems/,/Library/,/usr/,lib/tasks,.bundle,/config/,/lib/rspec/,/lib/rspec-,spec \
-        test/unit/*.rb || final_result=fail
+    if gem list | grep -q '^rcov '; then
+        test_runner=(
+            rcov
+            --aggregate coverage/testing.data
+            --exclude /gems/,/Library/,/usr/,lib/tasks,.bundle,/config/,/lib/rspec/,/lib/rspec-,spec
+        )
+        spec_runner=( "${test_runner[@]}" -Ispec:lib spec/*/*.rb    )
+        unit_runner=( "${test_runner[@]}" -Itest:lib test/unit/*.rb )
+    else
+        spec_runner=( rake spec )
+        unit_runner=( rake test )
+    fi
+    echo "Running specs ..."
+    bundle exec "${spec_runner[@]}" || final_result=fail
+    echo "Running unit tests ..."
+    bundle exec "${unit_runner[@]}" || final_result=fail
 
-    # Start rails
-    bundle exec script/rails s Puma >> log/test.out 2>> log/test.err &
-    sleep 10
-    (cd "$CROWBAR_TEST_DIR/BDD"; erl -s bdd test devtool -s init stop -noshell) || final_result=fail
-    kill $(ps -ef | grep Puma | grep ruby | awk '{ print $2 }')
+    # chefspec seems to go nuts with chef11... disable for now.
+    #echo "Running chef unit tests ..."
+    #find -path '*/chef/cookbooks' | xargs -r bundle exec rspec || final_result=fail
 
-    # Run chef unit tests
-    cd "$CROWBAR_TEST_DIR/chef/cookbooks"
-    rm README
-    bundle exec rspec * || final_result=fail
     [[ $final_result = pass ]]
 )
 
-clear_unit_tests() { rm -rf "$CROWBAR_TEST_DIR"; }
+run_BDD_tests() (
+    local final_result=pass
+    auto_reload_test_env
+    cd "$CROWBAR_TEST_DIR/opt/dell/crowbar_framework"
+    echo "Starting Rails app"
+    bundle exec script/rails s Puma >> log/test.out 2>> log/test.err &
+    sleep 10
+    (echo "Running BDD"; cd "$CROWBAR_TEST_DIR/opt/dell/BDD"; erl -s bdd test devtool -s init stop -noshell) || final_result=fail
+    echo "Stopping Rails app"
+    pkill -f 'ruby.*rails.*Puma'
+    [[ $final_result = pass ]]
+)
+
+clear_test_env() { rm -rf "$CROWBAR_TEST_DIR"; }
 
 # Create a new barclamp.
 create_barclamp() {
@@ -4147,21 +4369,37 @@ pull_request_handler() {
     local req=$1
     shift
     case $req in
-        fetch)   fetch_pull_requests_for_remote "$@";;
-        prep)    pull_requests_prep "$@";;
-        gen)     pull_requests_gen "$@";;
-        dirs)    pull_request_directories "$@";;
-        list)    list_pull_requests "$@";;
-        show)    show_pull_request "$@";;
-        builds)  builds_for_pull_request "$@";;
-        switch)  pull_request_switch "$@";;
-        merge)   pull_request_merge "$@";;
-        checkout) pull_request_checkout "$@";;
-        comment) pull_request_comment "$@";;
-        close)   pull_request_close "$@";;
-        '')      show_open_pull_requests "$@";;
-        *) die "$req is not a valid pull-request subcommand!" \
-            "Try $0 help pull-requests.";;
+        fetch)       fetch_pull_requests_for_remote "$@";;
+        prep)        pull_requests_prep "$@";;
+        gen)         pull_requests_gen "$@";;
+        dirs)        pull_request_directories "$@";;
+        list)        list_pull_requests "$@";;
+        show)        show_pull_request "$@";;
+        builds)      builds_for_pull_request "$@";;
+        switch)      pull_request_switch "$@";;
+        merge)       pull_request_merge "$@";;
+        multiswitch) pull_request_multiswitch "$@";;
+        checkout)    pull_request_checkout "$@";;
+        comment)     pull_request_comment "$@";;
+        close)       pull_request_close "$@";;
+        '')          show_open_pull_requests "$@";;
+        *)           dev_help 'pull-requests';;
+    esac
+}
+
+tests_handler() {
+    local req=$1
+    shift
+    case $req in
+        setup)     setup_test_env          "$@" ;;
+        run)       run_tests               "$@" ;;
+        run-units) run_unit_tests          "$@" ;;
+        run-BDD)   run_BDD_tests           "$@" ;;
+        server)    run_server              "$@" ;;
+        console)   run_console             "$@" ;;
+        reload)    reload_test_env         "$@" ;;
+        clear)     clear_test_env          "$@" ;;
+        *)         dev_help tests               ;;
     esac
 }
 
@@ -4183,18 +4421,16 @@ ci_helper() {
         all-open-ids) ci_ids "$@";;
         register-intent)
             ci_do_and_push ci_register_intent "$@";;
-        commit-intent)
-            ci_do_and_push ci_commit_intent "$@";;
-	expire-intent)
-            ci_do_and_push ci_expire_intent "$@";;
-	delete-intent)
-	    ci_do_and_push ci_delete_intent "$@";;
+        commit-intent) ci_commit_intent "$@";;
+	expire-intent) ci_expire_intent "$@";;
+	delete-intent) ci_delete_intent "$@";;
 	show-intents) ci_show_intents "$@";;
-        fail-intent)
-            ci_do_and_push ci_fail_intent "$@";;
+        fail-intent) ci_fail_intent "$@";;
         kill-stale-intents)
 	    ci_do_and_push ci_kill_stale_intents "$@";;
-        *) die "Not a valid CI command.  Run $0 help ci for valid CI commands.";;
+        *)
+            dev_help 'ci'
+            exit 1 ;;
     esac
 }
 # Hash for handling command -> function mapping.
@@ -4207,7 +4443,7 @@ DEV_COMMANDS["build-refs"]="refs_for_build"
 DEV_COMMANDS["builds"]="builds_in_release"
 DEV_COMMANDS["checkout"]="checkout"
 DEV_COMMANDS["ci"]="ci_helper"
-DEV_COMMANDS["clear-unit-tests"]="clear_unit_tests"
+DEV_COMMANDS["clear-unit-tests"]="clear_test_env"
 DEV_COMMANDS["clone-barclamps"]="clone_barclamps"
 DEV_COMMANDS["create-barclamp"]="create_barclamp"
 DEV_COMMANDS["crowbar-version"]="crowbar_version"
@@ -4221,8 +4457,9 @@ DEV_COMMANDS["flatten"]="flatten_crowbar"
 DEV_COMMANDS["help"]="dev_help"
 DEV_COMMANDS["is_clean"]="crowbar_is_clean"
 DEV_COMMANDS["local-changes"]="find_local_changed_branches_for_release"
+DEV_COMMANDS["merge"]="merge_releases"
 DEV_COMMANDS["missing-barclamps"]="find_missing_barclamps"
-DEV_COMMANDS["new-feature"]="cut_feature"
+DEV_COMMANDS["new-feature"]="new_feature"
 DEV_COMMANDS["orphaned-barclamps"]="find_orphaned_barclamps"
 DEV_COMMANDS["pin"]="pin_release"
 DEV_COMMANDS["pull-requests"]="pull_request_handler"
@@ -4236,19 +4473,23 @@ DEV_COMMANDS["redundant-barclamps"]="show_duplicate_barclamps"
 DEV_COMMANDS["refresh-tracking"]="update_all_tracking_branches"
 DEV_COMMANDS["release"]="current_release"
 DEV_COMMANDS["releases"]="show_releases"
-DEV_COMMANDS["reload-unit-tests"]="reload_unit_tests"
+DEV_COMMANDS["reload-unit-tests"]="reload_test_env"
 DEV_COMMANDS["remote"]="remote_wrapper"
 DEV_COMMANDS["remotes"]="remote_wrapper show"
 DEV_COMMANDS["reset-release"]="reset_release"
+DEV_COMMANDS["run-tests"]="run_tests"
+DEV_COMMANDS["run-BDD-tests"]="run_BDD_tests"
 DEV_COMMANDS["run-unit-tests"]="run_unit_tests"
 DEV_COMMANDS["scrub-merged-pulls"]="scrub_merged_pulls"
 DEV_COMMANDS["setup"]="setup"
-DEV_COMMANDS["setup-unit-tests"]="setup_unit_tests"
+DEV_COMMANDS["setup-unit-tests"]="setup_test_env"
 DEV_COMMANDS["switch"]="switch_release"
 DEV_COMMANDS["sync"]="sync_everything"
 DEV_COMMANDS["tag-build"]="tag_build"
+DEV_COMMANDS["tests"]="tests_handler"
 DEV_COMMANDS["unpin"]="unpin_release"
 DEV_COMMANDS["upstream-changes"]="find_remote_changed_branches_for_release"
+DEV_COMMANDS["bash_completion"]="dev_bash_completion"
 
 # Hash for short help
 DEV_SHORT_HELP["backup"]="             Back up changes without merging them into upstream."
@@ -4259,8 +4500,8 @@ DEV_SHORT_HELP["build"]="              Show the current build or build Crowbar"
 DEV_SHORT_HELP["builds"]="             Show the builds in the current release."
 DEV_SHORT_HELP["build-refs"]="         Show the Git commits that would be used in a build."
 DEV_SHORT_HELP["checkout"]="           Check out a branch in the current release."
-DEV_SHORT_HELP["ci"]="                 Heper for Continuous Intergration subcommands."
-DEV_SHORT_HELP["clear-unit-tests"]="   Remove unit test environment."
+DEV_SHORT_HELP["ci"]="                 Helper for Continuous Integration subcommands."
+DEV_SHORT_HELP["clear-unit-tests"]="   [deprecated] same as ./dev tests clear"
 DEV_SHORT_HELP["clone-barclamps"]="    Clone barclamps."
 DEV_SHORT_HELP["create-barclamp"]="    Create a new barclamp."
 DEV_SHORT_HELP["crowbar-version"]="    Print out a probably-unique ordered version string."
@@ -4274,6 +4515,7 @@ DEV_SHORT_HELP["flatten"]="            Flatten the main Crowbar repo branching s
 DEV_SHORT_HELP["help"]="               Show detailed help."
 DEV_SHORT_HELP["is_clean"]="           Test to see if all work is committed."
 DEV_SHORT_HELP["local-changes"]="      Find local changes from upstream for a release"
+DEV_SHORT_HELP["merge"]="              Merge other releases into the current release"
 DEV_SHORT_HELP["missing-barclamps"]="  Show missing barclamps."
 DEV_SHORT_HELP["new-feature"]="        Create a new feature bundle from the current release."
 DEV_SHORT_HELP["orphaned-barclamps"]=" Show barclamps that are not part of any build."
@@ -4289,21 +4531,32 @@ DEV_SHORT_HELP["redundant-barclamps"]="Show redundant barclamp metadata in a rel
 DEV_SHORT_HELP["refresh-tracking"]="   Update git branch tracking metadata."
 DEV_SHORT_HELP["release"]="            Show the current release or feature you are on."
 DEV_SHORT_HELP["releases"]="           Show all releases and features in your local repos."
-DEV_SHORT_HELP["reload-unit-tests"]="  Reload the data for the unit test environment"
+DEV_SHORT_HELP["reload-unit-tests"]="  [deprecated] same as ./dev tests reload"
 DEV_SHORT_HELP["remote"]="             Manage remotes across all Crowbar repositories."
 DEV_SHORT_HELP["remotes"]="            Show all remotes."
 DEV_SHORT_HELP["reset-release"]="      Resets a release to upstream or your last backup."
-DEV_SHORT_HELP["run-unit-tests"]="     Run unit and BDD tests."
+DEV_SHORT_HELP["run-tests"]="          [deprecated] same as ./dev tests run"
+DEV_SHORT_HELP["run-unit-tests"]="     [deprecated] same as ./dev tests run-units"
+DEV_SHORT_HELP["run-BDD-tests"]="      [deprecated] same as ./dev tests run-BDD"
 DEV_SHORT_HELP["scrub-merged-pulls"]=" Scrub merged pull request branches."
-DEV_SHORT_HELP["setup-unit-tests"]="   Sets up unit test environment."
+DEV_SHORT_HELP["setup-unit-tests"]="   [deprecated] same as ./dev tests setup"
 DEV_SHORT_HELP["setup"]="              Sets up a Crowbar checkout for use with dev."
 DEV_SHORT_HELP["switch"]="             Switch to a different release."
 DEV_SHORT_HELP["sync"]="               Synchronize fetched updates with the local repos."
 DEV_SHORT_HELP["tag-build"]="          Add annotated tags to all components of a particular build."
+DEV_SHORT_HELP["tests"]="              Various tasks relating to running tests."
 DEV_SHORT_HELP["unpin"]="              Unpin a release, build, or barclamp in a build."
 DEV_SHORT_HELP["upstream-changes"]="   Find unmerged changes from upstream for a release"
+DEV_SHORT_HELP["bash_completion"]="    Make tab ~/.bash_completion for dev (overwrites)"
 
 # Hash for long help
+DEV_LONG_HELP["merge"]="Merge other releases into the current release
+  This command interprets any arguments passed on the command line as
+  the names of releases to be merged into the current release."
+DEV_LONG_HELP["bash_completion"]="Enable tab command completion.
+  Overwrites /\$HOME/.bash_completion every time you run it. Inserts
+  all the implemented commands.  Not yet subcommands.  You need to
+  logout and login for it to function."
 DEV_LONG_HELP["setup"]="Perform initial setup of Crowbar.
   Sets up your local Crowbar repositories for working with the new
   Github regime.  By default, This command will prompt for your Github
@@ -4362,9 +4615,9 @@ DEV_LONG_HELP["remote"]="Manage remotes across all repositories.
   repository name as the origin remote does, and things will fail
   badly if this assumption is violated.  As an example, the urlbase
   for:
-    https://github.com/dellcloudedge/crowbar.git
+    https://github.com/crowbar/crowbar.git
   is:
-    https://github.com/dellcloudedge"
+    https://github.com/crowbar"
 DEV_LONG_HELP["remotes"]="Show all remotes."
 DEV_LONG_HELP["backup"]="Back up local changes to the personal remote.
   Push any locally committed changes into repositories that you have
@@ -4378,14 +4631,7 @@ DEV_LONG_HELP["sync"]="Synchronize local branches with their
   from upstream, as long as there are no rebase or merge conflicts and
   the results of the rebase are identical to the results of the
   equivalent merge.  dev is_clean should exit without any messages
-  before running this command.
-
-  If you pass an argument to sync, it will interpret that argument as
-  a release or feature name and try to merge any changes in common
-  branches from that release.  If you use the --from command, sync
-  will merge changes from the specified remote into your local
-  branches instead of merging in changes from the remote tracking
-  branches."
+  before running this command."
 DEV_LONG_HELP["push"]="Push a branch or branches to your personal remote.
   Unconditionally push a branch (or branches) to your crowbar Github
   fork.  Any arguments are interpreted as branch names to push, and if
@@ -4473,20 +4719,40 @@ DEV_LONG_HELP["scrub-merged-pulls"]="Scrub merged pull request tracking branches
   for pull requests that have already been merged.  If --all is passed
   as an option, then all pull request tracking branches will be
   deleted."
-DEV_LONG_HELP["setup-unit-tests"]="Sets up a unit test environment.
-  This will create the environment with all barclamps in /tmp/crowbar-dev-test.
-  Requires sudo access to install Ubuntu packages.  By passing in names of barclamps, the
-  setup command will only add those barclamps to the test environment.
+DEV_LONG_HELP["tests"]="Various tasks related to running tests.
+  Subcommands:
+    setup
+      This will create the environment with all barclamps in
+      /tmp/crowbar-dev-test.  By passing in names of barclamps, the
+      setup command will only add those barclamps to the test
+      environment.
 
-  setup-unit-tests also takes two optional arguments:
-    --update-gem-cache will copy the contents of /var/lib/gems/1.8 into
-        $CACHE_DIR/unit_tests/gems.  If you are managing your build cache
-        with git, these files will be automatically committed.
-    --offline will force bundler to use the files saved bu --update-gem-cache
-        instead of trying to use gems from the Internet."
-DEV_LONG_HELP["reload-unit-tests"]="Reload the code and database for the units.  Does not re-bundle."
-DEV_LONG_HELP["run-unit-tests"]="Run BDD and unit tests from the /tmp/crowbar environment."
-DEV_LONG_HELP["clear-unit-tests"]="Removes a unit test environment in /tmp/crowbar."
+      setup also takes two optional arguments:
+        --update-gem-cache will copy the contents of /var/lib/gems/1.9.1 into
+            $CACHE_DIR/unit_tests/gems.  If you are managing your build cache
+            with git, these files will be automatically committed.
+        --no-gem-cache will force bundler to use gems from the internet
+            instead of trying to use files saved by --update-gem-cache.
+    reload
+      Reload the code and database for the units.  Does not re-bundle.
+    run
+      Run all tests from the /tmp/crowbar environment.
+    run-BDD
+      Run BDD tests from the /tmp/crowbar environment.
+    run-units
+      Run unit tests and specs from the /tmp/crowbar environment.
+    server
+      Run the dev web server interactively
+    console
+      Run the dev console interactively
+    clear
+      Removes a test environment in /tmp/crowbar."
+DEV_LONG_HELP["setup-unit-tests"]="Deprecated; please see help for ./dev tests setup"
+DEV_LONG_HELP["reload-unit-tests"]="Deprecated; please see help for ./dev tests reload"
+DEV_LONG_HELP["run-tests"]="Deprecated; please see help for ./dev tests run"
+DEV_LONG_HELP["run-BDD-tests"]="Deprecated; please see help for ./dev tests run-BDD"
+DEV_LONG_HELP["run-unit-tests"]="Deprecated; please see help for ./dev tests run-units"
+DEV_LONG_HELP["clear-unit-tests"]="Deprecated; please see help for ./dev tests clear"
 DEV_LONG_HELP["refresh-tracking"]="Update remote tracking information for all the branches.
   Update remote tracking information for local branches in all the
   repos.  This command is run internally whenever dev does anything that
@@ -4612,9 +4878,16 @@ DEV_LONG_HELP["pull-requests"]="Manage pull requests.
       number, and the second argument must be a build that is applicable to
       the pull request.
 
+      To build in this state, you must: ./dev build --no-switch
+
       Please note that this will put any trees that have changes to be pulled
-      into a detached HEAD state.  You can use dev switch to get back to normal."
-DEV_LONG_HELP["ci"]="Crowbar Continuous Intergration Helper.
+      into a detached HEAD state.  You can use dev switch to get back to normal.
+    multiswitch: Switch to a new tree that has the contents of several pull
+      requests merged into it for expedited testing.  
+
+      The first argument must be the build you want to test, and
+      the rest of the arguments must be pull requests IDs."
+DEV_LONG_HELP["ci"]="Crowbar Continuous Integration Helper.
   Any of the CI subcommands that take an ID can either take a raw ID as
   returned by dev ci all-ids,
   or a pull request number as returned by dev pull-requests list, although the
@@ -4702,6 +4975,7 @@ fi
 in_repo origin_remote &>/dev/null || \
     [[ $1 = setup ]] || \
     die "Unable to find origin account, please run setup!"
+
 
 # Handle some global option parsing.
 # This is mainly for --from and --to handling.
