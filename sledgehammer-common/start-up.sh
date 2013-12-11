@@ -2,10 +2,15 @@
 
 set -x
 shopt -s extglob
+
+function is_suse {
+    [ -f /etc/SuSE-release ]
+}
+
 DHCPDIR=/var/lib/dhclient
 RSYSLOGSERVICE=rsyslog
 
-[ -e /etc/SuSE-release ] && {
+is_suse && {
  DHCPDIR=/var/lib/dhcp
  RSYSLOGSERVICE=syslog
 }
@@ -70,10 +75,14 @@ DOMAIN=$(grep "domain-name " $DHCPDIR/dhclient*.leases | \
     uniq | cut -d" " -f5 | cut -d";" -f1 | awk -F\" '{ print $2 }')
 HOSTNAME="d${MAC//:/-}.${DOMAIN}"
 sed -i -e "s/\(127\.0\.0\.1.*\)/127.0.0.1 $HOSTNAME ${HOSTNAME%%.*} localhost.localdomain localhost/" /etc/hosts
-if [ -f /etc/sysconfig/network ] ; then
-  sed -i -e "s/HOSTNAME=.*/HOSTNAME=${HOSTNAME}/" /etc/sysconfig/network
+if is_suse; then
+    echo "$HOSTNAME" > /etc/HOSTNAME
+else
+    if [ -f /etc/sysconfig/network ] ; then
+      sed -i -e "s/HOSTNAME=.*/HOSTNAME=${HOSTNAME}/" /etc/sysconfig/network
+    fi
+    echo "${HOSTNAME#*.}" >/etc/domainname
 fi
-echo "${HOSTNAME#*.}" >/etc/domainname
 hostname "$HOSTNAME"
 HOSTNAME_MAC="$HOSTNAME"
 
@@ -85,11 +94,18 @@ echo "# Sledgehammer added to log to the admin node" >> /etc/rsyslog.conf
 echo "*.* @@${ADMIN_IP}" >> /etc/rsyslog.conf
 service $RSYSLOGSERVICE restart
 
-# Setup common dirs
-for d in updates install-logs; do
-    mkdir -p /$d
-    mount -t nfs $ADMIN_IP:/$d /$d
+# Zap legacy log directory if it exists
+[[ -d /install-log ]] && rmdir /install-log
+
+# Setup common dirs based on what the Crowbar admin server is sharing
+exports=$(showmount -e $ADMIN_IP --no-headers | cut -f1 -d " ")
+for d in $exports; do
+    mkdir -p $d
+    mount -t nfs $ADMIN_IP:$d $d
 done
+
+# legacy protection to make sure that we have the old directory structure
+[[ -e /var/log/crowbar/sledgehammer ]] && ln -sf /var/log/crowbar/sledgehammer /install-log
 
 export MAC BOOTDEV ADMIN_IP DOMAIN HOSTNAME HOSTNAME_MAC MYIP
 

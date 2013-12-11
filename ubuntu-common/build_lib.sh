@@ -104,7 +104,7 @@ dpkg_info() {
             esac
             [[ $name && $ver && $arch ]] && break || :
         done < <(dpkg -I "$1")
-        SEEN_DEBS["${1##*/}"]="$name-$arch $ver"
+        SEEN_DEBS["${1##*/}"]="$name.$arch $ver"
     fi
     echo "${SEEN_DEBS["${1##*/}"]}"
 }
@@ -125,11 +125,13 @@ __barclamp_pkg_metadata_needs_update() (
 )
 
 __make_barclamp_pkg_metadata() {
-    in_chroot 'cd /mnt; dpkg-scanpackages . 2>/dev/null |gzip -9 >Packages.gz'
+    in_chroot 'cd /mnt; dpkg-scanpackages -m -a amd64 . 2>/dev/null |gzip -9 >Packages.gz'
     sudo chown -R "$(whoami)" "$CACHE_DIR/barclamps/$1/$OS_TOKEN/pkgs"
     if [[ $CURRENT_CACHE_BRANCH ]]; then
         in_cache git add "barclamps/$1/$OS_TOKEN/pkgs/Packages.gz"
-        in_cache git add "barclamps/$1/$OS_TOKEN/pkgs/Sources.gz"
+        if in_cache test -f "barclamps/$1/$OS_TOKEN/pkgs/Sources.gz"; then
+            in_cache git add "barclamps/$1/$OS_TOKEN/pkgs/Sources.gz"
+        fi
     fi
 }
 
@@ -179,17 +181,6 @@ __make_chroot() {
     fi
 }
 
-# Test to see of package $1 is more recent than package $2
-pkg_cmp() {
-    # $1 = Debian package 1
-    # $2 = Debian package 2
-    local deb1="$(dpkg_info "$1")"
-    local deb2="$(dpkg_info "$2")"
-    [[ ${deb1%% *} = ${deb2%% *} ]] || \
-        die "$1 and $2 do not reference the same package!"
-    vercmp "${deb1#* }" "${deb2#* }"
-}
-
 final_build_fixups() {
     # Copy our isolinux and preseed files.
     mv "$BUILD_DIR/extra/isolinux" "$BUILD_DIR/extra/preseed" "$BUILD_DIR"
@@ -202,14 +193,18 @@ final_build_fixups() {
     (   cd "$BUILD_DIR/initrd";
         debug "Adding all nic drivers"
         for udeb in "$IMAGE_DIR/pool/main/l/linux/"nic-*-generic-*.udeb; do
-            ar x "$udeb"
-            tar xzf data.tar.gz
-            rm -rf debian-binary *.tar.gz
+             [[ -f $udeb ]] && {
+                ar x "$udeb"
+                tar xzf data.tar.gz
+                rm -rf debian-binary *.tar.gz
+            } 
         done
         # bnx2x nic drivers require firmware images from the kernel image .deb
-        ar x "$IMAGE_DIR/pool/main/l/linux/"linux-image-*-generic_*.deb
-        tar xjf data.tar.bz2 --wildcards './lib/firmware/*/bnx2x/*'
-        rm -rf debian-binary control.tar.gz data.tar.bz2
+        [[ -f "$IMAGE_DIR/pool/main/l/linux/"linux-image-*-generic_*.deb ]] \
+        && { ar x "$IMAGE_DIR/pool/main/l/linux/"linux-image-*-generic_*.deb
+           tar xjf data.tar.bz2 --wildcards './lib/firmware/*/bnx2x/*'
+           rm -rf debian-binary control.tar.gz data.tar.bz2
+        } 
         # Make sure installing off a USB connected DVD will work
         debug "Adding USB connected DVD support"
         mkdir -p var/lib/dpkg/info
