@@ -13,14 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Author: Rob Hirschfeld
-# Author: Thomas Boerger
+# Author: RobHirschfeld
 #
 
-$LOAD_PATH.unshift(File.dirname(__FILE__))
+  # the 1st choice is to use the code from the framework since it is most up to date
+  # however, that code is not always available when installing
 
+require '/opt/dell/bin/barclamp_mgmt_lib.rb'
 require 'getoptlong'
-require 'barclamp_mgmt_lib'
 
 opts = GetoptLong.new(
   [ '--help', '-h', GetoptLong::NO_ARGUMENT ],
@@ -56,7 +56,7 @@ usage if ARGV.length < 1
     debug "Using #{path}"
     bc_file = File.join path, 'crowbar.yml'
     unless File.exist? bc_file
-      path = File.join BARCLAMP_PATH, path
+      path = File.join '/opt', 'dell', 'barclamps', path
       bc_file = File.join path, 'crowbar.yml'
     end
     barclamp = YAML.load_file bc_file

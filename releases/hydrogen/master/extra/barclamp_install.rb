@@ -13,15 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Author: Rob Hirschfeld
-# Author: Thomas Boerger
+# Author: RobHirschfeld
 #
 
-$LOAD_PATH.unshift(File.dirname(__FILE__))
-
+# the 1st choice is to use the code from the framework since it is most up to date
+# however, that code is not always available when installing
+require '/opt/dell/bin/barclamp_mgmt_lib.rb'
 require 'getoptlong'
 require 'pp'
-require 'barclamp_mgmt_lib'
 
 opts = GetoptLong.new(
   [ '--help', '-h', GetoptLong::NO_ARGUMENT ],
@@ -84,8 +83,8 @@ ARGV.each do |src|
   when File.exists?(File.join(src,"crowbar.yml"))
     # We were handed something that looks like a path to a barclamp
     candidates << File.expand_path(src)
-  when File.exists?(File.join(BARCLAMP_PATH, src,"crowbar.yml"))
-    candidates << File.join(BARCLAMP_PATH, src)
+  when File.exists?(File.join("/opt","dell","barclamps",src,"crowbar.yml"))
+    candidates << File.join("/opt","dell","barclamps",src)
   else
     puts "#{src} is not a barclamp, ignoring."
   end
@@ -123,8 +122,8 @@ debug "installing barclamps:"
 barclamps.values.sort_by{|v| v[:order]}.each do |bc|
   debug "bc = #{bc.pretty_inspect}"
   begin
-    unless /^#{BARCLAMP_PATH}/ =~ bc[:src]
-      target=File.join(BARCLAMP_PATH, bc[:src].split("/")[-1])
+    unless /^\/opt\/dell\/barclamps\// =~ bc[:src]
+      target="/opt/dell/barclamps/#{bc[:src].split("/")[-1]}"
       if File.directory? target
         debug "target directory #{target} exists"
         if File.exists? "#{target}/crowbar.yml"
