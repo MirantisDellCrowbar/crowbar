@@ -26,6 +26,7 @@ reboot
 %packages
 @base
 @core
+gcc-c++
 vim-enhanced
 keyutils
 trousers
