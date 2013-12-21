@@ -594,6 +594,9 @@ run_kvm() {
         -serial "file:$vm_logdir/ttyS0.log"
         -serial "file:$vm_logdir/ttyS1.log"
         -name "kvm-$vm_gen")
+    if [[ $kvm_cpu = true ]]; then
+        kvmargs+=(-cpu $kvm_cpu)
+    fi
     if [[ $kvm_use_ahci = true ]]; then
         kvmargs+=(-device "ahci,id=ahci0,bus=pci.0,multifunction=on")
         kvmargs+=(-drive "file=$smoketest_dir/$vmname.disk,if=none,format=raw,cache=$drive_cache,id=drive-ahci-0")
