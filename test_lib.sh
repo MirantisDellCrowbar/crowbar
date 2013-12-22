@@ -594,7 +594,7 @@ run_kvm() {
         -serial "file:$vm_logdir/ttyS0.log"
         -serial "file:$vm_logdir/ttyS1.log"
         -name "kvm-$vm_gen")
-    if [[ $kvm_cpu = true ]]; then
+    if [[ $kvm_cpu ]]; then
         kvmargs+=(-cpu $kvm_cpu)
     fi
     if [[ $kvm_use_ahci = true ]]; then
