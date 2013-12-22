@@ -575,6 +575,9 @@ run_kvm() {
         if "$KVM" -device \? 2>&1 |grep -q ahci && \
             [[ $("$KVM" -version) =~ kvm-1 ]]; then
             kvm_use_ahci=true
+            kvm_if=none
+        else
+            kvm_if=scsi
         fi
     fi
     local vm_gen="$vmname.${kvm_generations[$vmname]}"
@@ -599,19 +602,19 @@ run_kvm() {
     fi
     if [[ $kvm_use_ahci = true ]]; then
         kvmargs+=(-device "ahci,id=ahci0,bus=pci.0,multifunction=on")
-        kvmargs+=(-drive "file=$smoketest_dir/$vmname.disk,if=none,format=raw,cache=$drive_cache,id=drive-ahci-0")
+        kvmargs+=(-drive "file=$smoketest_dir/$vmname.disk,if=${kvm_if},format=raw,cache=$drive_cache,id=drive-ahci-0")
         kvmargs+=(-device "ide-drive,bus=ahci0.0,drive=drive-ahci-0,id=drive-0")
         local drive_idx=1
         for image in "$smoketest_dir/$vmname-"*".disk"; do
             [[ -f $image ]] || continue
             kvmargs+=(-device "ahci,id=ahci${drive_idx},bus=pci.0,multifunction=on")
-            kvmargs+=(-drive "file=$image,if=none,cache=$drive_cache,id=drive-ahci-${drive_idx}")
+            kvmargs+=(-drive "file=$image,if=${kvm_if},cache=$drive_cache,id=drive-ahci-${drive_idx}")
             kvmargs+=(-device "ide-drive,bus=ahci${drive_idx}.0,drive=drive-ahci-${drive_idx},id=drive-${drive_idx}")
             drive_idx=$((drive_idx + 1))
         done
         unset drive_idx
     else
-        local drivestr="file=$smoketest_dir/$vmname.disk,if=scsi,format=raw,cache=$drive_cache"
+        local drivestr="file=$smoketest_dir/$vmname.disk,if=${kvm_if},format=raw,cache=$drive_cache"
         if [[ $driveboot ]]; then
             drivestr+=",boot=on"
         fi
@@ -619,7 +622,7 @@ run_kvm() {
         # Add additional disks if we have any.
         for image in "$smoketest_dir/$vmname-"*".disk"; do
             [[ -f $image ]] || continue
-            kvmargs+=(-drive "file=$image,if=scsi,format=qcow2,cache=$drive_cache")
+            kvmargs+=(-drive "file=$image,if=${kvm_if},format=qcow2,cache=$drive_cache")
         done
     fi
     # Add appropriate nics based on the contents of vm_nics.
