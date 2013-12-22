@@ -12,15 +12,7 @@ firewall --disabled
 authconfig --enableshadow --enablemd5
 selinux --disabled
 timezone --utc UTC
-bootloader --location=mbr --driveorder=sda
-zerombr
-ignoredisk --only-use=sda
-clearpart --all --drives=sda
-part /boot --fstype ext4 --size=100 --ondisk=sda
-part swap --recommended
-part pv.6 --size=1 --grow --ondisk=sda
-volgroup lv_admin --pesize=32768 pv.6
-logvol / --fstype ext4 --name=lv_root --vgname=lv_admin --size=1 --grow
+%include "/tmp/partitions.ks"
 reboot
 
 %packages
@@ -38,6 +30,19 @@ emacs-nox
 openssh
 createrepo
 screen
+
+%pre --interpreter=/bin/bash
+[[ -b /dev/sda ]] && first_disk="sda"
+[[ -b /dev/vda ]] && first_disk="vda"
+echo "bootloader --location=mbr --driveorder=${first_disk}" > /tmp/partitions.ks
+echo "zerombr" >> /tmp/partitions.ks
+echo "ignoredisk --only-use=${first_disk}" >> /tmp/partitions.ks
+echo "clearpart --all --drives=${first_disk}" >> /tmp/partitions.ks
+echo "part /boot --fstype ext4 --size=100 --ondisk=${first_disk}" >> /tmp/partitions.ks
+echo "part swap --recommended" >> /tmp/partitions.ks
+echo "part pv.6 --size=1 --grow --ondisk=${first_disk}" >> /tmp/partitions.ks
+echo "volgroup lv_admin --pesize=32768 pv.6" >> /tmp/partitions.ks
+echo "logvol / --fstype ext4 --name=lv_root --vgname=lv_admin --size=1 --grow" >> /tmp/partitions.ks
 
 %post --nochroot
 export PS4='${BASH_SOURCE}@${LINENO}(${FUNCNAME[0]}): '
