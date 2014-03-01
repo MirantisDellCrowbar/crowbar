@@ -576,6 +576,9 @@ run_kvm() {
             [[ $("$KVM" -version) =~ kvm-1 ]]; then
             kvm_use_ahci=true
         fi
+        if "$KVM" -device \? 2>&1 |grep -q virtio-blk; then
+            kvm_use_ahci=false
+        fi
     fi
     local vm_gen="$vmname.${kvm_generations[$vmname]}"
     # create a new log directory for us.  vm_logdir needs to be global
@@ -589,6 +592,7 @@ run_kvm() {
     # PXE boot bugs in older versions of the E1000 etherboot roms.
     local kvmargs=(-enable-kvm
         -m $mem_size
+        -cpu host
         -smp $cpu_count
         -pidfile "$pidfile"
         -serial "file:$vm_logdir/ttyS0.log"
@@ -608,7 +612,7 @@ run_kvm() {
         done
         unset drive_idx
     else
-        local drivestr="file=$smoketest_dir/$vmname.disk,if=scsi,format=raw,cache=$drive_cache"
+        local drivestr="file=$smoketest_dir/$vmname.disk,if=virtio,format=raw,cache=$drive_cache"
         if [[ $driveboot ]]; then
             drivestr+=",boot=on"
         fi
@@ -616,13 +620,13 @@ run_kvm() {
         # Add additional disks if we have any.
         for image in "$smoketest_dir/$vmname-"*".disk"; do
             [[ -f $image ]] || continue
-            kvmargs+=(-drive "file=$image,if=scsi,format=qcow2,cache=$drive_cache")
+            kvmargs+=(-drive "file=$image,if=virtio,format=qcow2,cache=$drive_cache")
         done
     fi
     # Add appropriate nics based on the contents of vm_nics.
     local vlan=0
     for line in "${vm_nics[@]}"; do
-        kvmargs+=(-net "nic,macaddr=${line%%,*},model=e1000,vlan=$vlan")
+        kvmargs+=(-net "nic,macaddr=${line%%,*},model=virtio,vlan=$vlan")
         kvmargs+=(-net "tap,ifname=${line##*,},script=no,downscript=no,vlan=$vlan")
         vlan=$(($vlan + 1))
     done
