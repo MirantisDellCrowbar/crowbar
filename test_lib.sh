@@ -612,7 +612,7 @@ run_kvm() {
         done
         unset drive_idx
     else
-        local drivestr="file=$smoketest_dir/$vmname.disk,if=virtio,format=raw,cache=$drive_cache"
+        local drivestr="file=$smoketest_dir/$vmname.disk,if=scsi,format=raw,cache=$drive_cache"
         if [[ $driveboot ]]; then
             drivestr+=",boot=on"
         fi
