@@ -578,6 +578,7 @@ run_kvm() {
         fi
         if "$KVM" -device \? 2>&1 |grep -q virtio-blk; then
             kvm_use_ahci=false
+            kvm_use_virtio=true
         fi
     fi
     local vm_gen="$vmname.${kvm_generations[$vmname]}"
@@ -611,6 +612,18 @@ run_kvm() {
             drive_idx=$((drive_idx + 1))
         done
         unset drive_idx
+    fi
+    if [[ $kvm_use_virtio = true ]]; then
+        kvmargs+=(-drive "file=$smoketest_dir/$vmname.disk,if=none,format=raw,cache=$drive_cache,aio=native,id=drive-virtio-0")
+        kvmargs+=(-device "virtio-blk-pci,scsi=off,drive=drive-virtio-0,id=drive-0")
+        local drive_idx=1
+        for image in "$smoketest_dir/$vmname-"*".disk"; do
+            [[ -f $image ]] || continue
+            kvmargs+=(-drive "file=$image,if=none,cache=$drive_cache,aio=native,id=drive-virtio-${drive_idx}")
+            kvmargs+=(-device "virtio-blk-pci,scsi=off,drive=drive-virtio-${drive_idx},id=drive-${drive_idx}")
+            drive_idx=$((drive_idx + 1))
+        done
+        unset drive_idx
     else
         local drivestr="file=$smoketest_dir/$vmname.disk,if=scsi,format=raw,cache=$drive_cache"
         if [[ $driveboot ]]; then
@@ -620,7 +633,7 @@ run_kvm() {
         # Add additional disks if we have any.
         for image in "$smoketest_dir/$vmname-"*".disk"; do
             [[ -f $image ]] || continue
-            kvmargs+=(-drive "file=$image,if=virtio,format=qcow2,cache=$drive_cache")
+            kvmargs+=(-drive "file=$image,if=scsi,format=qcow2,cache=$drive_cache")
         done
     fi
     # Add appropriate nics based on the contents of vm_nics.
