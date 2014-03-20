@@ -31,11 +31,11 @@ install_base_packages() {
 }
 
 bring_up_chef() {
-    gem install chef
+    log_to yum yum -q -y install rubygem-chef rubygem-kwalify
     service chef-client stop
     killall chef-client
-    log_to yum yum -q -y install curl-devel ruby-shadow patch
-    gem install chef-server
+    log_to yum yum -q -y install rubygem-chef-server \
+        curl-devel ruby-shadow patch
     (cd "$DVD_PATH/extra/patches"; chmod +x ./patch.sh; ./patch.sh) || exit 1
     # Default password in chef webui to password
     sed -i 's/web_ui_admin_default_password ".*"/web_ui_admin_default_password "password"/' /etc/chef/webui.rb
@@ -48,6 +48,9 @@ bring_up_chef() {
    # increase chef-solr index field size
     perl -i -ne 'if ($_ =~ /<maxFieldLength>(.*)<\/maxFieldLength>/){ print "<maxFieldLength>200000</maxFieldLength> \n" } else { print } '  /var/chef/solr/conf/solrconfig.xml
     log_to svc service chef-server restart
+
+    # Update Chef via gems
+    gem install chef chef-server
 }
 
 pre_crowbar_fixups() {
