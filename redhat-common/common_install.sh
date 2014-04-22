@@ -70,9 +70,9 @@ EOF
 done
 
 # Make sure we only try to install x86_64 packages.
-echo 'exclude = *.i?86' >>/etc/yum.conf
+#echo 'exclude = *.i?86' >>/etc/yum.conf
 # Nuke any non-64 bit packages that snuck in.
-yum -y erase '*.i?86'
+#yum -y erase '*.i?86'
 yum -y makecache
 
 yum -y install createrepo

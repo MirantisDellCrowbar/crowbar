@@ -193,7 +193,7 @@ __make_chroot() {
     done
     # Make sure yum does not throw away our caches for any reason.
     in_chroot /bin/sed -i -e "'/keepcache/ s/0/1/'" /etc/yum.conf
-    in_chroot "echo 'exclude = *.i?86' >>/etc/yum.conf"
+#    in_chroot "echo 'exclude = *.i?86' >>/etc/yum.conf"
 
     [[ $USE_PROXY = "1" ]] && (
         cd "$CHROOT"
